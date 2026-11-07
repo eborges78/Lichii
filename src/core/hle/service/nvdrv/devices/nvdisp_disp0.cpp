@@ -4,13 +4,17 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <boost/container/small_vector.hpp>
 
 #include "common/adpf.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/debugger/debug_present_clock.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
@@ -88,6 +92,15 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     }
 
     system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
+    // Debug input must advance on Switch 1 too. Count one submitted stack, not each
+    // layer/vsync, and leave VI2's existing Switch 2 counter and normal runs alone.
+    static const bool debug_requested = [] {
+        const char* value = std::getenv("EDEN_NX2_DEBUG_SERVER");
+        return value != nullptr && *value != '\0';
+    }();
+    Core::Nx2Debug::RecordLegacyDebugPresent(Core::g_nx2_present_count, debug_requested,
+                                            Settings::CurrentProgramIsSwitch2(),
+                                            !sorted_layers.empty());
     Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <span>
 #include <vector>
 
@@ -69,6 +70,8 @@ private:
         SparseBuffer handle;
         vk::Buffer gathered;
         u64 tick{};
+        VkDeviceSize size{};
+        size_t owner_count{};
     };
 
     struct Entry {
@@ -98,10 +101,22 @@ private:
 
     void DrainRetired(Scheduler& scheduler);
 
+    void TraceGatheredRequest(VkDeviceSize size, size_t owners, bool sparse_candidate);
+
     ::Common::unordered_map<u64, Entry> entries;
     boost::container::static_vector<Retired, MAX_RETIRED> retired;
     u32 sparse_memory_type_bits{};
     VkBufferUsageFlags sparse_usage{};
+    std::chrono::steady_clock::time_point last_memory_trace{};
+    u64 gathered_created_count{};
+    u64 gathered_created_requested_bytes{};
+    u64 sparse_created_count{};
+    u64 sparse_created_span_bytes{};
+    u64 released_count{};
+    u64 gathered_request_count{};
+    u64 gathered_requested_bytes{};
+    u32 gathered_request_events{};
+    u32 small_gathered_request_events{};
 };
 
 } // namespace Vulkan

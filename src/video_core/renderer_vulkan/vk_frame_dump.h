@@ -43,6 +43,11 @@ public:
     /// Captures the next frame for the debug server, which is told `id`. False while a capture
     /// runs.
     bool Arm(bool sampled, bool buffers, u64 id);
+    /// Starts a buffer-only snapshot now. Refuses both active and pending captures.
+    bool BeginImmediateBuffers();
+    [[nodiscard]] bool Busy() const noexcept {
+        return enabled && !done;
+    }
     /// Once per presented frame: whether a capture starts with the next frame or has ended.
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
@@ -164,6 +169,9 @@ public:
     /// Captures the next frame into `directory` for the debug server, which is told `id` once
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
     void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
+    /// Synchronous diagnostic snapshot, completed before the draw is recorded.
+    bool BeginImmediateBuffers(std::filesystem::path directory);
+    void FinishImmediateBuffers();
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
@@ -218,6 +226,8 @@ private:
     void WriteBuffer(const Job& job);
     void WriteFile(const std::string& name, std::span<const u8> data);
     void StopWriter();
+    void ResetCapture(std::filesystem::path directory);
+    bool StartCapture();
 
     const Device& device;
     MemoryAllocator& memory_allocator;
@@ -225,6 +235,7 @@ private:
 
     FrameDumpSchedule schedule;
     bool truncated{};
+    bool immediate_buffers{};
     std::filesystem::path directory;
     std::chrono::steady_clock::time_point start;
 

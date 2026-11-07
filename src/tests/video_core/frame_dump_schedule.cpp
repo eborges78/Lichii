@@ -108,3 +108,53 @@ TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_sch
     REQUIRE(by_file.Frame() == 90);
     std::filesystem::remove_all(directory);
 }
+
+TEST_CASE("Immediate buffer snapshots start without Tick and finish before the next frame",
+          "[frame_dump_schedule]") {
+    FrameDumpSchedule schedule;
+    REQUIRE(schedule.BeginImmediateBuffers());
+    REQUIRE(schedule.Capturing());
+    REQUIRE(schedule.Buffers());
+    REQUIRE_FALSE(schedule.Sampled());
+    REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
+    REQUIRE(schedule.Frame() == 0);
+    REQUIRE(schedule.CaptureId() == 0);
+    REQUIRE_FALSE(schedule.BeginImmediateBuffers());
+    REQUIRE_FALSE(schedule.Arm(true, true, 5));
+    schedule.Abort();
+    REQUIRE_FALSE(schedule.Capturing());
+    REQUIRE_FALSE(schedule.Busy());
+    REQUIRE(schedule.Tick(10.0) == Step::None);
+    REQUIRE(schedule.Arm(true, false, 5));
+    REQUIRE(schedule.Tick(10.0) == Step::Start);
+    REQUIRE(schedule.CaptureId() == 5);
+    REQUIRE(Vulkan::RecordingSampledTextures());
+    REQUIRE(schedule.Tick(10.0) == Step::Finish);
+}
+
+TEST_CASE("Immediate buffer snapshots preserve pending and active normal captures",
+          "[frame_dump_schedule]") {
+    FrameDumpSchedule schedule;
+    REQUIRE(schedule.Arm(true, false, 9));
+    REQUIRE_FALSE(schedule.BeginImmediateBuffers());
+    REQUIRE(schedule.CaptureId() == 9);
+    REQUIRE_FALSE(schedule.Capturing());
+    REQUIRE(schedule.Tick(1.0) == Step::Start);
+    REQUIRE_FALSE(schedule.BeginImmediateBuffers());
+    REQUIRE(schedule.Sampled());
+    REQUIRE_FALSE(schedule.Buffers());
+    REQUIRE(Vulkan::RecordingSampledTextures());
+    REQUIRE(schedule.Tick(1.0) == Step::Finish);
+    REQUIRE(schedule.BeginImmediateBuffers());
+    REQUIRE(schedule.CaptureId() == 0);
+    REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
+    schedule.Abort();
+
+    FrameDumpSchedule timed;
+    timed.Configure("30", {}, true);
+    REQUIRE_FALSE(timed.BeginImmediateBuffers());
+    REQUIRE(timed.Tick(29.0) == Step::None);
+    REQUIRE(timed.Tick(30.0) == Step::Start);
+    REQUIRE(timed.Sampled());
+    REQUIRE(timed.Tick(31.0) == Step::Finish);
+}

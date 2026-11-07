@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <array>
 #include <cstdlib>
@@ -22,11 +23,13 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/textures/depth_aspect.h"
 #include "video_core/nx2.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -40,7 +43,9 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/memory_thresholds.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/transcode_cache.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -544,16 +549,12 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     if (info.IsRenderTarget()) {
         return ImageAspectMask(info.format);
     }
-    bool any_r =
-        std::ranges::any_of(info.Swizzle(), [](SwizzleSource s) { return s == SwizzleSource::R; });
     switch (info.format) {
     case PixelFormat::D24_UNORM_S8_UINT:
     case PixelFormat::D32_FLOAT_S8_UINT:
-        // R = depth, G = stencil
-        return any_r ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
     case PixelFormat::S8_UINT_D24_UNORM:
-        // R = stencil, G = depth
-        return any_r ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+        return Tegra::Texture::SamplesStencil(info.format, info.Swizzle())
+                   ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     case PixelFormat::D16_UNORM:
     case PixelFormat::D32_FLOAT:
     case PixelFormat::X8_D24_UNORM:
@@ -2743,6 +2744,10 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
     return device.GetDeviceLocalMemory();
 }
 
+bool TextureCacheRuntime::IsIntegrated() const {
+    return device.IsIntegrated();
+}
+
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
     return device.GetDeviceMemoryUsage();
 }
@@ -2839,38 +2844,104 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+void TextureCacheRuntime::CollectCompletedTranscodes() {
+    if (pending_transcodes.empty()) {
+        return;
+    }
+    const bool traced = TraceTranscodeMemory("before_collect");
+    // IsFree uses a cached completion value. Poll the timeline without waiting so loading
+    // several textures within one frame can reuse work that has already finished on the GPU.
+    scheduler.GetMasterSemaphore().Refresh();
+    // Finished decode images wait for the next texture of their shape, up to this much memory.
+    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    VideoCommon::CollectCompletedTranscodes(
+        pending_transcodes, free_transcodes, [this](u64 tick) { return scheduler.IsFree(tick); },
+        MaxFreeTranscodeBytes);
+    TraceTranscodeMemory("after_collect", false, false, traced);
+}
+
+void TextureCacheRuntime::ApplyTranscodeBackpressure() {
+    if (!VideoCommon::UsesOotIntegratedMemoryBudget(
+            Settings::GetCurrentProgramID(), IsIntegrated(), GetDeviceLocalMemory(),
+            Common::GetMemInfo().TotalPhysicalMemory)) {
+        return;
+    }
+    constexpr u64 MaxPendingBytes = u64{256} << 20;
+    transcode_oversized_count +=
+        VideoCommon::TranscodeDecodedBytes(pending_transcodes.back()) > MaxPendingBytes;
+    if (!VideoCommon::TranscodesExceedBudget(pending_transcodes, MaxPendingBytes)) {
+        return;
+    }
+    CollectCompletedTranscodes();
+    // The input staging buffer has already been consumed by AssembleInto. Waiting here may
+    // flush the current encode/copy tick safely; waiting before decode could retire its input
+    // staging allocation before the decoder consumes it. Peak pending storage is budget + one image.
+    const bool drained = VideoCommon::DrainTranscodesToBudget(
+        pending_transcodes, MaxPendingBytes,
+        [this](u64 tick) {
+            const auto begin = std::chrono::steady_clock::now();
+            scheduler.Wait(tick);
+            ++transcode_backpressure_count;
+            transcode_backpressure_us += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - begin).count());
+        },
+        [this] { CollectCompletedTranscodes(); });
+    ASSERT_MSG(drained, "ASTC wait completed without retiring the oldest transcode");
+    TraceTranscodeMemory("after_backpressure");
+}
+
+bool TextureCacheRuntime::TraceTranscodeMemory(const char* phase, bool allocated, bool reused,
+                                              bool force) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TRANSCODE_TRACE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled || !Settings::CurrentProgramIsSwitch2()) {
+        return false;
+    }
+    transcode_allocations += allocated;
+    transcode_reuses += reused;
+    u64 pending_bytes{}, free_bytes{};
+    for (const auto& transcode : pending_transcodes) {
+        pending_bytes = VideoCommon::TranscodeByteSum(
+            pending_bytes, VideoCommon::TranscodeDecodedBytes(transcode));
+    }
+    for (const auto& transcode : free_transcodes) {
+        free_bytes = VideoCommon::TranscodeByteSum(
+            free_bytes, VideoCommon::TranscodeDecodedBytes(transcode));
+    }
+    transcode_max_pending_bytes = (std::max)(transcode_max_pending_bytes, pending_bytes);
+    transcode_max_pending_count = (std::max)(transcode_max_pending_count, pending_transcodes.size());
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && transcode_last_memory_trace.time_since_epoch().count() != 0 &&
+        now - transcode_last_memory_trace < std::chrono::seconds{1}) {
+        return false;
+    }
+    transcode_last_memory_trace = now;
+    LOG_INFO(Render_Vulkan,
+             "Nx2 memory ASTC transcodes {}: pending={} bytes/{} images free={} bytes/{} images "
+             "allocated={} reused={} max_pending={} bytes/{} images completed_tick={} current_tick={} "
+             "backpressure_count={} backpressure_us={} oversized_transcodes={}",
+             phase, pending_bytes, pending_transcodes.size(), free_bytes, free_transcodes.size(),
+             transcode_allocations, transcode_reuses, transcode_max_pending_bytes,
+             transcode_max_pending_count, scheduler.GetMasterSemaphore().KnownGpuTick(),
+             scheduler.CurrentTick(), transcode_backpressure_count, transcode_backpressure_us,
+             transcode_oversized_count);
+    return true;
+}
+
 void TextureCacheRuntime::TickFrame() {
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    CollectCompletedTranscodes();
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
+    TraceTranscodeMemory("frame");
     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
         if (!scheduler.IsFree(scratch.tick)) {
             scratch.unused_frames = 0;
@@ -4173,6 +4244,36 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     using Shader::TextureType;
 
     const VkImageAspectFlags aspect_mask = ImageViewAspectMask(info);
+    samples_depth24 = aspect_mask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                      Tegra::Texture::SamplesDepth24(format, info.Swizzle());
+    if (VideoCommon::RenderTrace::Enabled() &&
+        Common::Log::IsLevelEnabled(Common::Log::Class::Render_Vulkan,
+                                    Common::Log::Level::Debug)) {
+        const auto image_type = VideoCore::Surface::GetFormatType(image.info.format);
+        const auto view_type = VideoCore::Surface::GetFormatType(format);
+        if (image_type == SurfaceType::Depth || image_type == SurfaceType::DepthStencil ||
+            view_type == SurfaceType::Depth || view_type == SurfaceType::DepthStencil) {
+            // Process-wide bound, including multiple texture-cache threads. Do not infer the
+            // guest image format from the Vulkan format or the sampled view's TIC format.
+            static std::atomic<u32> remaining{512};
+            u32 available = remaining.load(std::memory_order_relaxed);
+            while (available != 0 &&
+                   !remaining.compare_exchange_weak(available, available - 1,
+                                                    std::memory_order_relaxed)) {}
+            if (available != 0) {
+                LOG_DEBUG(Render_Vulkan,
+                          "Render trace depth view: address={:#x} image_format={} view_format={} "
+                          "image_size={}x{}x{} view_size={}x{}x{} base_level={} base_layer={} "
+                          "levels={} layers={} aspect={:#x} render_target={} samples_depth24={} "
+                          "trace_remaining={}",
+                          image.gpu_addr, image.info.format, format, image.info.size.width,
+                          image.info.size.height, image.info.size.depth, size.width, size.height,
+                          size.depth, range.base.level, range.base.layer, range.extent.levels,
+                          range.extent.layers, aspect_mask, info.IsRenderTarget(), samples_depth24,
+                          available - 1);
+            }
+        }
+    }
     std::array<SwizzleSource, 4> swizzle{
         SwizzleSource::R,
         SwizzleSource::G,
@@ -4595,6 +4696,28 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     return *it->sampler;
 }
 
+VkSamplerCreateInfo Sampler::EffectiveCreateInfo(const VariantKey& key) const noexcept {
+    VkSamplerCreateInfo create_info = base_ci;
+    if (key.force_nearest) {
+        create_info.magFilter = VK_FILTER_NEAREST;
+        create_info.minFilter = VK_FILTER_NEAREST;
+        create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        create_info.anisotropyEnable = VK_FALSE;
+        create_info.maxAnisotropy = 1.0f;
+    } else if (key.reduce_anisotropy) {
+        create_info.anisotropyEnable = static_cast<VkBool32>(default_anisotropy > 1.0f);
+        create_info.maxAnisotropy = default_anisotropy;
+    }
+    return create_info;
+}
+
+bool Sampler::SamplesSingleTexel(const ImageView& image_view) const noexcept {
+    const VariantKey key = MakeKey(image_view, false);
+    const auto mode = has_minmax_reduction && !key.drop_reduction
+        ? reduction_mode : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
+    return IsPointDepthSampler(EffectiveCreateInfo(key), mode);
+}
+
 VkSampler Sampler::Emplace(VariantKey key) {
     bool custom_border = has_custom_border_colors && !key.drop_custom_border;
     if (custom_border && !custom_border_color_budget.TryAcquire(*device_ptr, 1)) {
@@ -4642,18 +4765,8 @@ VkSampler Sampler::Emplace(VariantKey key) {
         chain = &reduction_ci;
     }
 
-    VkSamplerCreateInfo create_info = base_ci;
+    VkSamplerCreateInfo create_info = EffectiveCreateInfo(key);
     create_info.pNext = chain;
-    if (key.force_nearest) {
-        create_info.magFilter = VK_FILTER_NEAREST;
-        create_info.minFilter = VK_FILTER_NEAREST;
-        create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        create_info.anisotropyEnable = VK_FALSE;
-        create_info.maxAnisotropy = 1.0f;
-    } else if (key.reduce_anisotropy) {
-        create_info.anisotropyEnable = static_cast<VkBool32>(default_anisotropy > 1.0f);
-        create_info.maxAnisotropy = default_anisotropy;
-    }
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
@@ -4674,23 +4787,31 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
     if (handle == VK_NULL_HANDLE) {
         handle = Emplace(key);
     }
-    if (VideoCommon::RenderTrace::Enabled() && (is_depth || has_depth_comparison)) {
+    if (VideoCommon::RenderTrace::Enabled() &&
+        (is_depth || has_depth_comparison || image_view.SamplesDepth24())) {
         static thread_local std::set<std::tuple<VkSampler, VkImage, s32, s32, s32, bool, bool>> seen;
         if (seen.size() < 4096 &&
             seen.emplace(handle, image_view.ImageHandle(), image_view.range.base.level,
                          image_view.range.base.layer, image_view.range.extent.layers,
                          is_depth, Settings::IsDockedMode()).second) {
+            const VkSamplerCreateInfo effective = EffectiveCreateInfo(key);
+            const auto effective_reduction = has_minmax_reduction && !key.drop_reduction
+                ? reduction_mode : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
             LOG_DEBUG(Render_Vulkan,
                       "Render trace depth sampler: docked={} address={:#x} format={} {}x{} "
                       "base_level={} base_layer={} layers={} shader_depth={} compare_enable={} compare_op={} "
-                      "compare_supported={} min_filter={} mag_filter={} border={} address_modes={}/{}/{}",
+                      "compare_supported={} min_filter={} mag_filter={} mip_mode={} anisotropy={} "
+                      "reduction={} point_d24={} border={} address_modes={}/{}/{}",
                       Settings::IsDockedMode(), image_view.GpuAddr(), image_view.format,
                       image_view.size.width, image_view.size.height, image_view.range.base.level,
                       image_view.range.base.layer,
-                      image_view.range.extent.layers, is_depth, base_ci.compareEnable,
-                      static_cast<u32>(base_ci.compareOp), image_view.SupportsDepthComparison(),
-                      static_cast<u32>(key.force_nearest ? VK_FILTER_NEAREST : base_ci.minFilter),
-                      static_cast<u32>(key.force_nearest ? VK_FILTER_NEAREST : base_ci.magFilter),
+                      image_view.range.extent.layers, is_depth, effective.compareEnable,
+                      static_cast<u32>(effective.compareOp), image_view.SupportsDepthComparison(),
+                      static_cast<u32>(effective.minFilter), static_cast<u32>(effective.magFilter),
+                      static_cast<u32>(effective.mipmapMode),
+                      effective.anisotropyEnable ? effective.maxAnisotropy : 1.0f,
+                      static_cast<u32>(effective_reduction),
+                      image_view.SamplesDepth24() && IsPointDepthSampler(effective, effective_reduction),
                       static_cast<u32>(base_ci.borderColor), static_cast<u32>(base_ci.addressModeU),
                       static_cast<u32>(base_ci.addressModeV), static_cast<u32>(base_ci.addressModeW));
         }
@@ -4805,6 +4926,19 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     runtime_ptr = &runtime;
     render_area.width = (std::min)(render_area.width, width);
     render_area.height = (std::min)(render_area.height, height);
+    // Attachmentless passes still have to obey the host framebuffer limits. Keep the
+    // same extent for framebuffer creation, render-pass begin, resolves and clears.
+    const VkExtent2D max_extent = runtime.device.GetMaxFramebufferExtent();
+    if (render_area.width > max_extent.width || render_area.height > max_extent.height) {
+        const VkExtent2D requested_extent = render_area;
+        render_area.width = (std::min)(render_area.width, max_extent.width);
+        render_area.height = (std::min)(render_area.height, max_extent.height);
+        LOG_WARNING(Render_Vulkan,
+                    "Framebuffer extent limited: requested={}x{}, effective={}x{}, "
+                    "device_max={}x{}, attachments={}",
+                    requested_extent.width, requested_extent.height, render_area.width,
+                    render_area.height, max_extent.width, max_extent.height, attachments.size());
+    }
 
     if (do_resolve_color) {
         for (size_t index = 0; index < NUM_RT; ++index) {
@@ -4931,11 +5065,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+    CollectCompletedTranscodes();
     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
         return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
     });
+    const bool reused = reusable != free_transcodes.end();
     PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
+    if (reused) {
         pending = std::move(*reusable);
         free_transcodes.erase(reusable);
     } else {
@@ -5027,6 +5163,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
+    TraceTranscodeMemory("queued", !reused, reused);
+    ApplyTranscodeBackpressure();
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {

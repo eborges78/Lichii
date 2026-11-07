@@ -161,3 +161,28 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
     }
     REQUIRE(callback.load());
 }
+
+TEST_CASE("Idle fence workers stop after empty and drained lifetimes",
+          "[video_core][split_fence_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    SCOPE_EXIT { Settings::values.gpu_fence_behavior.SetValue(previous); };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    std::atomic<u32> callbacks{};
+    for (u32 i = 0; i < 256; ++i) {
+        FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+        if ((i & 1) != 0) {
+            manager.SyncOperation([&] { ++callbacks; });
+            manager.WaitPendingFences(true);
+        }
+        // Exercise shutdown both before the worker starts waiting and after a drained batch.
+    }
+    REQUIRE(callbacks.load() == 128);
+    REQUIRE_FALSE(submission.timed_out.load());
+    REQUIRE_FALSE(submission.wrong_owner);
+}

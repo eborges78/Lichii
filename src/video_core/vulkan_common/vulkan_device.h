@@ -429,6 +429,11 @@ FN_MAX_LIMIT_LIST
 #undef FN_MAX_LIMIT_ELEM
 #undef FN_MAX_LIMIT_LIST
 
+    VkExtent2D GetMaxFramebufferExtent() const {
+        const auto& limits = properties.properties.limits;
+        return {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
+    }
+
     /// Returns float control properties of the device.
     const VkPhysicalDeviceFloatControlsPropertiesKHR& FloatControlProperties() const {
         return properties.float_controls;

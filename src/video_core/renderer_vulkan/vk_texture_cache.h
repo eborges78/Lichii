@@ -99,6 +99,8 @@ public:
 
     u64 GetDeviceLocalMemory() const;
 
+    bool IsIntegrated() const;
+
     u64 GetDeviceMemoryUsage() const;
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
@@ -286,6 +288,10 @@ public:
     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
+    void CollectCompletedTranscodes();
+    void ApplyTranscodeBackpressure();
+    bool TraceTranscodeMemory(const char* phase, bool allocated = false, bool reused = false,
+                              bool force = false);
 
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
@@ -301,6 +307,14 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    u64 transcode_allocations{};
+    u64 transcode_reuses{};
+    u64 transcode_max_pending_bytes{};
+    size_t transcode_max_pending_count{};
+    u64 transcode_backpressure_count{};
+    u64 transcode_backpressure_us{};
+    u64 transcode_oversized_count{};
+    std::chrono::steady_clock::time_point transcode_last_memory_trace{};
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
@@ -731,6 +745,8 @@ public:
         return samples;
     }
 
+    [[nodiscard]] bool SamplesDepth24() const noexcept { return samples_depth24; }
+
     [[nodiscard]] bool SupportsDepthComparison() const noexcept {
         return supports_depth_comparison;
     }
@@ -785,6 +801,7 @@ private:
 
     VkComponentMapping swizzle_mapping{};
 
+    bool samples_depth24{};
     bool supports_depth_comparison = false;
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
@@ -813,6 +830,17 @@ private:
     size_t held = 0;
 };
 
+inline bool IsPointDepthSampler(const VkSamplerCreateInfo& info,
+                                VkSamplerReductionModeEXT reduction) noexcept {
+    return info.magFilter == VK_FILTER_NEAREST && info.minFilter == VK_FILTER_NEAREST &&
+           info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+           info.anisotropyEnable == VK_FALSE && info.compareEnable == VK_FALSE &&
+           reduction == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT &&
+           info.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+           info.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+           info.addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+}
+
 class Sampler {
 public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
@@ -822,6 +850,7 @@ public:
     }
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
+    [[nodiscard]] bool SamplesSingleTexel(const ImageView& image_view) const noexcept;
 
     /// The guest descriptor and the host state built from it, for EDEN_NX2_FRAME_DUMP_SAMPLED.
     [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
@@ -857,6 +886,7 @@ private:
 
     [[nodiscard]] VariantKey MakeKey(const ImageView& image_view, bool is_depth) const noexcept;
     [[nodiscard]] VkSampler Find(const VariantKey& key) const noexcept;
+    [[nodiscard]] VkSamplerCreateInfo EffectiveCreateInfo(const VariantKey& key) const noexcept;
     VkSampler Emplace(VariantKey key);
 
     CustomBorderColorBudget custom_border_color_budget;

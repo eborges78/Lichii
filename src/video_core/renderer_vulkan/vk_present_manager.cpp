@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/dkb_frame_trace.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -194,8 +195,23 @@ void PresentManager::Present(Frame* frame) {
             frame_cv.notify_one();
         });
     } else {
+        const bool trace = Common::DkbFrameTrace::Enabled();
+        const auto begin = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
         scheduler.WaitWorker();
+        const auto worker_done = trace ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
         CopyToSwapchain(frame);
+        if (trace) {
+            const auto end = std::chrono::steady_clock::now();
+            static thread_local Common::DkbFrameTrace::RateLimit limit;
+            if (end - begin >= std::chrono::milliseconds{100} || limit.Ready(end)) {
+                LOG_INFO(Render_Vulkan,
+                         "DKB present wait_worker_wall_ms={:.3f} copy_swapchain_wall_ms={:.3f}",
+                         std::chrono::duration<double, std::milli>(worker_done - begin).count(),
+                         std::chrono::duration<double, std::milli>(end - worker_done).count());
+            }
+        }
         free_queue.push_back(frame);
     }
 }

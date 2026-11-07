@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cmath>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 
@@ -55,7 +58,8 @@ struct TensorProgram {
     IR::Program program;
     Profile profile;
 
-    explicit TensorProgram(u32 count = 1, u32 software_depth = 0) {
+    explicit TensorProgram(u32 count = 1, u32 software_depth = 0, bool storage_output = true,
+                           u32 rounding_case = 0) {
         program.stage = Stage::Compute;
         program.workgroup_size = {64, 1, 1};
         program.blocks = {&block};
@@ -77,6 +81,31 @@ struct TensorProgram {
             inputs[i] = software_depth ? ir.IAdd(ir.Imm32(0x3c003c00U + i * 0x01000100U),
                 ir.ShiftLeftLogical(lane, ir.Imm32(3))) : ir.IAdd(ir.Imm32((i + 1) * 0x01000100U), lane);
         }
+        if (rounding_case != 0) {
+            // A, B, C, upper-K8 A. Only the first K component is nonzero, except
+            // the cancellation case. All values are binary16 bit patterns.
+            constexpr std::array<std::array<u32, 4>, 10> cases{{
+                {0x1000, 0x3c00, 0x3c00, 0}, // even tie at 1
+                {0x1000, 0x3c00, 0x3c01, 0}, // odd tie at 1 + ulp
+                {0x0001, 0x3800, 0, 0},      // half of the minimum subnormal
+                {0x0003, 0x3800, 0, 0},      // odd subnormal tie
+                {0x8001, 0x3800, 0x8000, 0}, // negative underflow
+                {0x7bff, 0x3c00, 0x4c00, 0}, // positive overflow tie
+                {0xfbff, 0x3c00, 0xcc00, 0}, // negative overflow tie
+                {0x0400, 0x3800, 0, 0},      // normal to subnormal
+                {0x1000, 0x3c00, 0x3c00, 0x1000}, // K16 must round halfway
+                {0xbc003c00, 0x3c00, 0x0001, 0},  // ordered cancellation
+            }};
+            const auto& values = cases.at(rounding_case - 1);
+            const auto first = ir.IEqual(ir.BitwiseAnd(lane, ir.Imm32(3)), ir.Imm32(0));
+            for (u32 i = 0; i < 4; ++i) {
+                inputs[i] = IR::U32{ir.Select(first, ir.Imm32(values[i < 2 ? 0 : 3]), ir.Imm32(0))};
+            }
+            for (u32 i = 4; i < 8; ++i) {
+                const u32 half = values[i < 6 ? 1 : 2];
+                inputs[i] = ir.Imm32(half | (half << 16));
+            }
+        }
         for (u32 i = 0; i < count; ++i) {
             const auto result = ir.TensorMulAdd(
                                        ir.CompositeConstruct(inputs[0], inputs[1], inputs[2], inputs[3]),
@@ -85,7 +114,7 @@ struct TensorProgram {
             inputs[6] = IR::U32{ir.CompositeExtract(result, 0)};
             inputs[7] = IR::U32{ir.CompositeExtract(result, 1)};
         }
-        if (software_depth) {
+        if (software_depth && storage_output) {
             program.info.used_storage_buffer_types = IR::Type::U32;
             program.info.storage_buffers_descriptors = {{0, 0, 1, true}};
             program.info.uses_local_invocation_id = true;
@@ -151,142 +180,275 @@ TEST_CASE("Software HMMA shares a bounded loop without tensor extensions", "[vid
     }
 }
 
-TEST_CASE("Software HMMA rounds only on uniform K8 boundaries", "[video_core][tensor][ampere]") {
+TEST_CASE("Software HMMA rounds after each complete unrolled K8 group", "[video_core][tensor][ampere]") {
     for (const u32 depth : {8U, 16U}) {
-        TensorProgram fixture{1, depth};
-        const auto code = fixture.Emit();
-        std::map<u32, u32> constants;
-        for (const auto& words : Instructions(code, 43)) { // OpConstant
-            constants.emplace(words[1], words[2]);
-        }
+        for (const bool quad : {false, true}) {
+            TensorProgram fixture{1, depth};
+            fixture.profile.support_quad_shuffles = quad;
+            const auto code = fixture.Emit();
+            std::map<u32, u32> constants;
+            for (const auto& words : Instructions(code, 43)) { // OpConstant
+                constants.emplace(words[1], words[2]);
+            }
+            REQUIRE(Instructions(code, 247).empty()); // No per-pair rounding branch.
+            const auto limits = Instructions(code, 176); // OpULessThan
+            REQUIRE(limits.size() == 1);
+            REQUIRE(constants.at(limits.front()[3]) == depth / 8);
+            const auto branches = Instructions(code, 250); // OpBranchConditional
+            REQUIRE(branches.size() == 1);
+            REQUIRE(branches.front()[0] == limits.front()[1]);
+            const u32 body = branches.front()[1];
+            const auto loads = Instructions(code, 61); // OpLoad
+            const auto counter_load = std::ranges::find_if(loads, [&](const auto& words) {
+                return words[1] == limits.front()[2];
+            });
+            REQUIRE(counter_load != loads.end());
+            const u32 counter = (*counter_load)[2];
+            const auto additions = Instructions(code, 128); // OpIAdd
+            u32 initializations = 0;
+            u32 increments = 0;
+            for (const auto& store : Instructions(code, 62)) {
+                if (store[0] != counter) {
+                    continue;
+                }
+                if (constants.contains(store[1])) {
+                    REQUIRE(constants.at(store[1]) == 0);
+                    ++initializations;
+                } else {
+                    const auto increment = std::ranges::find_if(additions, [&](const auto& words) {
+                        return words[1] == store[1];
+                    });
+                    REQUIRE(increment != additions.end());
+                    REQUIRE((*increment)[2] == limits.front()[2]);
+                    REQUIRE(constants.at((*increment)[3]) == 1);
+                    ++increments;
+                }
+            }
+            REQUIRE(initializations == 1);
+            REQUIRE(increments == 1);
 
-        const auto selections = Instructions(code, 247); // OpSelectionMerge
-        REQUIRE(selections.size() == 1);
-        REQUIRE(selections.front()[1] == 2); // DontFlatten
-        const u32 merge = selections.front()[0];
-        const auto branches = Instructions(code, 250); // OpBranchConditional
-        const auto branch = std::ranges::find_if(branches, [=](const auto& words) {
-            return words[2] == merge;
-        });
-        REQUIRE(branch != branches.end());
-        const u32 condition = (*branch)[0];
-        const u32 round_block = (*branch)[1];
-        REQUIRE(round_block != merge);
-
-        const auto comparisons = Instructions(code, 170); // OpIEqual
-        const auto comparison = std::ranges::find_if(comparisons, [=](const auto& words) {
-            return words[1] == condition;
-        });
-        REQUIRE(comparison != comparisons.end());
-        const u32 component = (*comparison)[2];
-        const u32 boundary = constants.at((*comparison)[3]);
-        const auto masks = Instructions(code, 199); // OpBitwiseAnd
-        const auto mask = std::ranges::find_if(masks, [=](const auto& words) {
-            return words[1] == component;
-        });
-        REQUIRE(mask != masks.end());
-        const u32 pair = (*mask)[2];
-        const u32 pair_mask = constants.at((*mask)[3]);
-        REQUIRE(pair_mask == 3);
-        REQUIRE(boundary == 3);
-        const auto loads = Instructions(code, 61); // OpLoad
-        const auto pair_load = std::ranges::find_if(loads, [=](const auto& words) {
-            return words[1] == pair;
-        });
-        REQUIRE(pair_load != loads.end());
-        const u32 counter = (*pair_load)[2];
-        const auto stores = Instructions(code, 62); // OpStore
-        const auto additions = Instructions(code, 128); // OpIAdd
-        u32 initializations = 0;
-        u32 increments = 0;
-        for (const auto& store : stores) {
-            if (store[0] != counter) {
-                continue;
+            u32 block = 0;
+            u32 fmas = 0;
+            u32 rounded = 0;
+            std::vector<u32> fma_ids;
+            std::vector<u32> rounded_accumulators;
+            for (size_t offset = 5; offset < code.size();) {
+                const u32 length = code[offset] >> 16;
+                const u32 opcode = code[offset] & 0xffffU;
+                const auto words = std::span{code}.subspan(offset + 1, length - 1);
+                if (opcode == 248) { // OpLabel
+                    block = words[0];
+                } else if (opcode == 12 && words[3] == 50) { // GLSL.std.450 Fma
+                    REQUIRE(block == body);
+                    REQUIRE(rounded == 0);
+                    ++fmas;
+                    fma_ids.push_back(words[1]);
+                } else if (opcode == 12 && words[3] == 2) { // GLSL.std.450 RoundEven
+                    REQUIRE(block == body);
+                    REQUIRE(fmas == 32); // Eight ordered products per accumulator.
+                    ++rounded;
+                } else if (opcode == 62 && block == body) {
+                    rounded_accumulators.push_back(words[0]);
+                }
+                offset += length;
             }
-            if (constants.contains(store[1])) {
-                REQUIRE(constants.at(store[1]) == 0);
-                ++initializations;
-            } else {
-                const auto increment = std::ranges::find_if(additions, [&](const auto& words) {
-                    return words[1] == store[1];
-                });
-                REQUIRE(increment != additions.end());
-                REQUIRE((*increment)[2] == pair);
-                REQUIRE(constants.at((*increment)[3]) == 1);
-                ++increments;
+            REQUIRE(fmas == 32);
+            REQUIRE(rounded == 4);
+            REQUIRE(rounded_accumulators.size() == 4);
+            std::ranges::sort(rounded_accumulators);
+            REQUIRE(std::ranges::adjacent_find(rounded_accumulators) == rounded_accumulators.end());
+            const auto decorations = Instructions(code, 71); // OpDecorate
+            for (const u32 id : fma_ids) {
+                REQUIRE(std::ranges::any_of(decorations, [=](const auto& words) {
+                    return words[0] == id && words[1] == 42; // NoContraction
+                }));
             }
         }
-        REQUIRE(initializations == 1);
-        REQUIRE(increments == 1); // No lane-dependent input controls rounding.
-        const auto limits = Instructions(code, 176); // OpULessThan
-        const auto limit = std::ranges::find_if(limits, [=](const auto& words) {
-            return words[2] == pair;
-        });
-        REQUIRE(limit != limits.end());
-        const u32 pairs = constants.at((*limit)[3]);
-        REQUIRE(pairs == depth / 2);
-        std::vector<u32> rounded_pairs;
-        for (u32 value = 0; value < pairs; ++value) {
-            if ((value & pair_mask) == boundary) {
-                rounded_pairs.push_back(value);
-            }
-        }
-        REQUIRE(rounded_pairs == (depth == 8 ? std::vector<u32>{3} : std::vector<u32>{3, 7}));
-
-        // Inspect the generated function, not a second implementation of its branch.
-        // Every expensive conversion is inside the true block; no collective is.
-        u32 block = 0;
-        u32 rounding_operations = 0;
-        u32 fma_operations = 0;
-        u32 shuffles = 0;
-        std::vector<u32> rounded_accumulators;
-        bool round_rejoins = false;
-        for (size_t offset = 5; offset < code.size();) {
-            const u32 length = code[offset] >> 16;
-            const u32 opcode = code[offset] & 0xffffU;
-            REQUIRE(length != 0);
-            REQUIRE(offset + length <= code.size());
-            const auto words = std::span{code}.subspan(offset + 1, length - 1);
-            if (opcode == 248) { // OpLabel
-                block = words[0];
-            } else if (opcode == 12 && words[3] == 2) { // GLSL.std.450 RoundEven
-                REQUIRE(block == round_block);
-                ++rounding_operations;
-            } else if (opcode == 12 && words[3] == 50) { // GLSL.std.450 Fma
-                REQUIRE(block != round_block);
-                ++fma_operations;
-            } else if (opcode == 345) { // OpGroupNonUniformShuffle
-                REQUIRE(block != round_block);
-                ++shuffles;
-            } else if (opcode == 62 && block == round_block) { // OpStore
-                rounded_accumulators.push_back(words[0]);
-            } else if (opcode == 249 && block == round_block) { // OpBranch
-                REQUIRE(words[0] == merge);
-                round_rejoins = true;
-            } else if (opcode == 169) { // OpSelect must not evaluate a discarded conversion.
-                REQUIRE(words[2] != condition);
-            }
-            offset += length;
-        }
-        REQUIRE(rounding_operations == 4);
-        REQUIRE(fma_operations == 8);
-        REQUIRE(shuffles == 4);
-        REQUIRE(round_rejoins);
-        REQUIRE(rounded_accumulators.size() == 4);
-        std::ranges::sort(rounded_accumulators);
-        REQUIRE(std::ranges::adjacent_find(rounded_accumulators) == rounded_accumulators.end());
     }
 }
 
-TEST_CASE("Software matrix helpers also emit for 64-lane host subgroups",
+TEST_CASE("Software HMMA emitted exchanges preserve matrix products across both warps",
           "[video_core][tensor][ampere]") {
     for (const u32 depth : {8U, 16U}) {
-        TensorProgram fixture{1, depth};
-        fixture.profile.max_subgroup_size = 64;
-        const auto code = fixture.Emit(depth == 8 ? "software-k8-wave64" : "software-k16-wave64");
-        REQUIRE_FALSE(HasCapability(code, 5357));
-        REQUIRE(Instructions(code, 246).size() == 1);
-        REQUIRE(Instructions(code, 345).size() == 4); // OpGroupNonUniformShuffle
+        for (const u32 subgroup_size : {32U, 64U}) {
+            for (const bool quad : {false, true}) {
+                TensorProgram fixture{1, depth};
+                fixture.profile.max_subgroup_size = subgroup_size;
+                fixture.profile.support_quad_shuffles = quad;
+                const auto code = fixture.Emit("software-k" + std::to_string(depth) +
+                    "-wave" + std::to_string(subgroup_size) + (quad ? "-quad" : "-shuffle"));
+                REQUIRE_FALSE(HasCapability(code, 5357));
+                REQUIRE(HasCapability(code, 68) == quad); // GroupNonUniformQuad
+                REQUIRE(Instructions(code, 246).size() == 1); // OpLoopMerge
+                REQUIRE(Instructions(code, 345).size() == (quad ? 8 : 16));
+                REQUIRE(Instructions(code, 365).size() == (quad ? 8 : 0));
+
+                // Evaluate the emitted exchange-index expressions, not a duplicate of the
+                // emitter's address calculation. Distinct values in each warp expose leaks.
+                std::map<u32, std::pair<u32, std::vector<u32>>> definitions;
+                for (const u32 opcode : {43U, 61U, 128U, 196U, 199U}) {
+                    for (const auto& words : Instructions(code, opcode)) {
+                        definitions.emplace(words[1], std::pair{opcode, words});
+                    }
+                }
+                u32 lane_variable = 0;
+                for (const auto& words : Instructions(code, 71)) { // BuiltIn SubgroupLocalInvocationId
+                    if (words.size() >= 3 && words[1] == 11 && words[2] == 41) {
+                        lane_variable = words[0];
+                    }
+                }
+                REQUIRE(lane_variable != 0);
+                std::function<u32(u32, u32)> evaluate = [&](u32 id, u32 lane) -> u32 {
+                    const auto& [opcode, words] = definitions.at(id);
+                    switch (opcode) {
+                    case 43: return words[2];
+                    case 61:
+                        REQUIRE(words[2] == lane_variable);
+                        return lane;
+                    case 128: return evaluate(words[2], lane) + evaluate(words[3], lane);
+                    case 196: return evaluate(words[2], lane) << evaluate(words[3], lane);
+                    case 199: return evaluate(words[2], lane) & evaluate(words[3], lane);
+                    default: FAIL("Unexpected exchange address opcode"); return 0;
+                    }
+                };
+                std::vector<std::pair<u32, std::vector<u32>>> exchanges;
+                for (size_t offset = 5; offset < code.size();) {
+                    const u32 length = code[offset] >> 16;
+                    const u32 opcode = code[offset] & 0xffffU;
+                    if (opcode == 345 || opcode == 365) {
+                        exchanges.emplace_back(opcode, std::vector<u32>{
+                            code.begin() + offset + 1, code.begin() + offset + length});
+                    }
+                    offset += length;
+                }
+                REQUIRE(exchanges.size() == 16);
+                const auto source_lane = [&](u32 exchange, u32 lane) {
+                    const auto& [opcode, words] = exchanges[exchange];
+                    REQUIRE(evaluate(words[2], lane) == 3); // Subgroup scope
+                    const u32 index = evaluate(words[4], lane);
+                    return opcode == 365 ? (lane & ~3U) + index : index;
+                };
+                const auto operand = [](u32 lane, u32 word, u32 half) {
+                    return std::ldexp(static_cast<float>(static_cast<s32>(
+                        (lane * 17 + word * 7 + half * 3) % 61) - 30), -5);
+                };
+                for (u32 lane = 0; lane < subgroup_size; ++lane) {
+                    for (u32 row = 0; row < 2; ++row) {
+                        for (u32 col = 0; col < 2; ++col) {
+                            float actual = 0;
+                            float expected = 0;
+                            for (u32 k = 0; k < depth; ++k) {
+                                const u32 component = (k % 8) / 2;
+                                const u32 a_lane = source_lane(component * 4 + 2 + row, lane);
+                                const u32 b_lane = source_lane(component * 4 + col, lane);
+                                const u32 expected_a = (lane & ~31U) + (lane & 28U) + component;
+                                const u32 expected_b = (lane & ~31U) + (lane & 3U) * 8 + col * 4 + component;
+                                REQUIRE(a_lane == expected_a);
+                                REQUIRE(b_lane == expected_b);
+                                const u32 a_word = row + (k / 8) * 2;
+                                const u32 b_word = 4 + k / 8;
+                                actual = std::fma(operand(a_lane, a_word, k % 2),
+                                                  operand(b_lane, b_word, k % 2), actual);
+                                expected = std::fma(operand(expected_a, a_word, k % 2),
+                                                    operand(expected_b, b_word, k % 2), expected);
+                            }
+                            REQUIRE(actual == expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Software HMMA uses quad broadcasts only in supported compute stages",
+          "[video_core][tensor][ampere]") {
+    TensorProgram fixture{1, 8, false};
+    fixture.profile.support_quad_shuffles = true;
+    fixture.program.stage = Stage::VertexB;
+    fixture.profile.supported_subgroup_stages |= 1U << static_cast<u32>(Stage::VertexB);
+    const auto code = fixture.Emit();
+    REQUIRE(Instructions(code, 365).empty());
+    REQUIRE(Instructions(code, 345).size() == 16);
+}
+
+TEST_CASE("Tensor f16 conversions request precise intermediate rounding and preserve fallback",
+          "[video_core][tensor][ampere]") {
+    for (const u32 depth : {8U, 16U}) {
+        // Case 0 varies A/B/C by lane; verify_tensor_fixture.py selects its reference
+        // when --rounding-case is omitted. Cases 1..10 exercise rounding boundaries.
+        for (u32 rounding_case = 0; rounding_case <= 10; ++rounding_case) {
+            for (const bool native_round : {false, true}) {
+                TensorProgram fixture{1, depth, true, rounding_case};
+                fixture.profile.support_quad_shuffles = true;
+                fixture.profile.support_float_controls = true;
+                fixture.profile.support_tensor_float16_rounding = native_round;
+                fixture.profile.support_fp16_signed_zero_nan_preserve = true;
+                const auto code = fixture.Emit("round-case" + std::to_string(rounding_case) +
+                    "-k" + std::to_string(depth) + (native_round ? "-fp16" : "-software"));
+                const auto conversions = Instructions(code, 115); // OpFConvert
+                REQUIRE(conversions.size() == (native_round ? 8 : 0));
+                const auto decorations = Instructions(code, 71); // OpDecorate
+                for (const auto& conversion : conversions) {
+                    REQUIRE(std::ranges::any_of(decorations, [&](const auto& words) {
+                        return words[0] == conversion[1] && words[1] == 42; // NoContraction
+                    }));
+                }
+                for (size_t index = 0; index < conversions.size(); index += 2) {
+                    const auto types = Instructions(code, 22); // OpTypeFloat
+                    for (const auto& [offset, width] : {std::pair{0U, 16U}, std::pair{1U, 32U}}) {
+                        REQUIRE(std::ranges::any_of(types, [&](const auto& words) {
+                            return words[0] == conversions[index + offset][0] && words[1] == width;
+                        }));
+                    }
+                    REQUIRE(conversions[index + 1][2] == conversions[index][1]);
+                }
+                if (native_round) {
+                    u32 fmas_before_rounding = 0;
+                    for (size_t offset = 5; offset < code.size();) {
+                        const u32 length = code[offset] >> 16;
+                        const u32 opcode = code[offset] & 0xffff;
+                        if (opcode == 12 && code[offset + 4] == 50) { // GLSL.std.450 Fma
+                            ++fmas_before_rounding;
+                        } else if (opcode == 115) {
+                            REQUIRE(fmas_before_rounding == 32);
+                        }
+                        offset += length;
+                    }
+                }
+                REQUIRE(HasCapability(code, 9) == native_round); // Float16
+                const auto modes = Instructions(code, 16); // OpExecutionMode
+                for (const u32 mode : {4459U, 4461U, 4462U}) { // preserve denorm/sign/NaN, RTE
+                    REQUIRE(std::ranges::any_of(modes, [=](const auto& words) {
+                        return words.size() == 3 && words[1] == mode && words[2] == 16;
+                    }) == native_round);
+                }
+                // The f32->f16->f32 pair cannot become an unrounded f32 accumulator.
+                if (native_round) {
+                    const auto types = Instructions(code, 22); // OpTypeFloat
+                    const auto converts = Instructions(code, 115);
+                    for (size_t i = 0; i < converts.size(); i += 2) {
+                        const auto half_type = std::ranges::find_if(types, [&](const auto& words) {
+                            return words[0] == converts[i][0];
+                        });
+                        REQUIRE(half_type != types.end());
+                        REQUIRE((*half_type)[1] == 16);
+                        REQUIRE(converts[i + 1][2] == converts[i][1]);
+                    }
+                }
+            }
+        }
+    }
+    for (const u32 blocker : {0U, 1U, 2U, 3U, 4U}) {
+        TensorProgram fixture{1, 16};
+        fixture.profile.support_tensor_float16_rounding = true;
+        fixture.profile.support_float_controls = true;
+        if (blocker == 0) fixture.profile.support_tensor_float16_rounding = false;
+        if (blocker == 1) fixture.profile.support_float_controls = false;
+        if (blocker == 2) fixture.profile.has_broken_fp16_float_controls = true;
+        if (blocker == 3) fixture.program.info.uses_fp16_denorms_flush = true;
+        if (blocker == 4) fixture.program.info.uses_fp64 = true;
+        REQUIRE(Instructions(fixture.Emit(), 115).empty());
     }
 }
 

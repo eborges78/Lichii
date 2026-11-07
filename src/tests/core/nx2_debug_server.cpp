@@ -13,6 +13,7 @@
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
+#include "core/debugger/debug_present_clock.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/device_memory.h"
@@ -434,6 +435,63 @@ TEST_CASE("Debug input steps follow the present count exactly", "[core][nx2_debu
     REQUIRE(Core::Nx2Debug::InputAt(steps, 10, 12)->buttons == Core::HID::NpadButton::None);
     REQUIRE(Core::Nx2Debug::InputAt(steps, 10, 13)->buttons == Core::HID::NpadButton::B);
     REQUIRE_FALSE(Core::Nx2Debug::InputAt(steps, 10, 14));
+}
+
+TEST_CASE("Legacy debug compositions start and release frame-timed input",
+          "[core][nx2_debug_server]") {
+    std::atomic<u64> count{0};
+    const u64 start = count.load(std::memory_order_relaxed) + 1;
+    const std::vector<Core::Nx2Debug::InputStep> steps{
+        Core::Nx2Debug::ParseInputStep(json{{"right_stick", {0.6, 0.0}}, {"frames", 2}}),
+        Core::Nx2Debug::ParseInputStep(json{{"right_stick", {0.0, 0.0}}, {"frames", 1}}),
+    };
+    const auto input = [&] {
+        return Core::Nx2Debug::InputAt(steps, start, count.load(std::memory_order_relaxed));
+    };
+    REQUIRE_FALSE(input());
+    Core::Nx2Debug::RecordLegacyDebugPresent(count, true, false, true);
+    REQUIRE(count.load() == 1);
+    REQUIRE(input());
+    REQUIRE(input()->right);
+    REQUIRE(input()->right->x > 0);
+    Core::Nx2Debug::RecordLegacyDebugPresent(count, true, false, true);
+    REQUIRE(input());
+    REQUIRE(input()->right);
+    REQUIRE(input()->right->x > 0);
+    Core::Nx2Debug::RecordLegacyDebugPresent(count, true, false, true);
+    REQUIRE(input());
+    REQUIRE(input()->right);
+    REQUIRE(input()->right->x == 0);
+    Core::Nx2Debug::RecordLegacyDebugPresent(count, true, false, true);
+    REQUIRE_FALSE(input());
+
+    // Same reset value used by nvdrv::Module for the next emulation session.
+    count.store(0, std::memory_order_relaxed);
+    REQUIRE_FALSE(input());
+    Core::Nx2Debug::RecordLegacyDebugPresent(count, true, false, true);
+    REQUIRE(input());
+    REQUIRE(input()->right);
+    REQUIRE(input()->right->x > 0);
+}
+
+TEST_CASE("Legacy debug clock leaves normal runs and VI2 counting unchanged",
+          "[core][nx2_debug_server]") {
+    for (bool debug_requested : {false, true}) {
+        for (bool is_switch2 : {false, true}) {
+            for (bool has_layers : {false, true}) {
+                CAPTURE(debug_requested, is_switch2, has_layers);
+                std::atomic<u64> count{27};
+                Core::Nx2Debug::RecordLegacyDebugPresent(count, debug_requested, is_switch2,
+                                                        has_layers);
+                REQUIRE(count.load() ==
+                        27 + static_cast<u64>(debug_requested && !is_switch2 && has_layers));
+            }
+        }
+    }
+    std::atomic<u64> vi2_count{27};
+    vi2_count.fetch_add(1, std::memory_order_relaxed); // Existing VI2 present.
+    Core::Nx2Debug::RecordLegacyDebugPresent(vi2_count, true, true, true);
+    REQUIRE(vi2_count.load() == 28); // Never a second increment through legacy composition.
 }
 
 TEST_CASE("Injected input merges buttons and replaces sticks while installed", "[core][nx2_debug_server]") {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -29,6 +30,34 @@ struct DescriptorMemory {
     }
 };
 } // namespace
+
+TEST_CASE("Descriptor tables grow without reserving large unused ranges", "[descriptor_table][memory]") {
+    VideoCommon::DescriptorTable<Tegra::Texture::TICEntry> table;
+    constexpr std::array<u32, 7> limits{0, 1, 63, 64, 255, 1024, 0xfffff};
+
+    for (const u32 limit : limits) {
+        table.Refresh(GPUVAddr{0x1000}, limit);
+        REQUIRE(table.descriptors.size() >= static_cast<size_t>(limit) + 1);
+        REQUIRE(table.descriptors.size() <= (static_cast<size_t>(limit) + 1) * 2);
+        REQUIRE(table.read_descriptors.size() * 64 >= static_cast<size_t>(limit) + 1);
+        REQUIRE(std::ranges::all_of(table.read_descriptors, [](u64 bits) { return bits == 0; }));
+        std::ranges::fill(table.read_descriptors, ~u64{0});
+    }
+}
+
+TEST_CASE("Refreshing a descriptor table clears old read marks", "[descriptor_table][memory]") {
+    VideoCommon::DescriptorTable<Tegra::Texture::TICEntry> table;
+    table.Refresh(GPUVAddr{0x1000}, 255);
+    REQUIRE(table.descriptors.size() * sizeof(Tegra::Texture::TICEntry) <= 16 * 1024);
+    std::ranges::fill(table.read_descriptors, ~u64{0});
+
+    REQUIRE_FALSE(table.Synchronize(GPUVAddr{0x1000}, 255));
+    REQUIRE(table.Synchronize(GPUVAddr{0x2000}, 127));
+    REQUIRE(std::ranges::all_of(table.read_descriptors, [](u64 bits) { return bits == 0; }));
+    std::ranges::fill(table.read_descriptors, ~u64{0});
+    REQUIRE(table.Synchronize(GPUVAddr{0x2000}, 1024));
+    REQUIRE(std::ranges::all_of(table.read_descriptors, [](u64 bits) { return bits == 0; }));
+}
 
 TEST_CASE("Descriptor invalidation matches eager refresh across mutations", "[descriptor_table]") {
     DescriptorMemory memory;
@@ -117,7 +146,8 @@ TEST_CASE("Descriptor limits clear exposed slots after shrink and growth", "[des
             std::memcpy(output, &address, size);
         }
     } memory;
-    constexpr std::array<u32, 9> limits{0, 63, 64, 127, 128, 0x7ffff, 0x80000, 0x80001, 0x100000};
+    constexpr std::array<u32, 10> limits{0, 63, 64, 127, 128, 0x7ffff, 0x80000, 0x80001,
+                                       0x100000, 0x3fffff};
     for (const u32 limit : limits) {
         VideoCommon::DescriptorTable<u64> table;
         REQUIRE(table.Synchronize(0x1000, limit));
@@ -135,10 +165,22 @@ TEST_CASE("Descriptor limits clear exposed slots after shrink and growth", "[des
         CHECK(table.Read(memory, limit).second);
         CHECK_FALSE(table.Read(memory, limit).second);
     }
-    for (const u32 limit :
-         {std::numeric_limits<u32>::max(), std::numeric_limits<u32>::max() - 0x1000}) {
+    for (const u32 limit : {0x400000U, std::numeric_limits<u32>::max(),
+                           std::numeric_limits<u32>::max() - 0x1000}) {
         VideoCommon::DescriptorTable<u64> table;
-        table.Refresh(0x1000, limit);
+        table.Refresh(0x1000, 127);
+        const auto* descriptors = table.descriptors.data();
+        const auto* ids = table.bound_ids.data();
+        table.Invalidate();
+        REQUIRE_THROWS_AS(table.Refresh(0x2000, limit), std::out_of_range);
+        REQUIRE_THROWS_AS(table.Synchronize(0x2000, limit), std::out_of_range);
+        REQUIRE(table.current_gpu_addr == 0x1000);
+        REQUIRE(table.current_limit == 127);
+        REQUIRE(table.descriptors.data() == descriptors);
+        REQUIRE(table.bound_ids.data() == ids);
+        REQUIRE(table.descriptors.size() == 128);
+        REQUIRE(table.bound_ids.size() == 128);
+        REQUIRE(table.invalidated);
         CHECK(table.Read(memory, 0).second);
         table.Invalidate();
         CHECK(table.Read(memory, 0).second);
@@ -318,7 +360,19 @@ TEST_CASE("Descriptor Debug poisoning touches only the current addressable range
     REQUIRE(table.bound_ids.capacity() == 0);
 
     REQUIRE(table.Synchronize(0x1000, 127));
-    REQUIRE(table.bound_ids.size() == 524289);
+    REQUIRE(table.bound_ids.size() == 128);
+    REQUIRE(table.Synchronize(0x1000, 255));
+    const auto* descriptor_storage = table.descriptors.data();
+    const auto* id_storage = table.bound_ids.data();
+    const auto descriptor_capacity = table.descriptors.capacity();
+    const auto id_capacity = table.bound_ids.capacity();
+    REQUIRE(table.Synchronize(0x1000, 127));
+    REQUIRE(table.descriptors.data() == descriptor_storage);
+    REQUIRE(table.bound_ids.data() == id_storage);
+    REQUIRE(table.descriptors.capacity() == descriptor_capacity);
+    REQUIRE(table.bound_ids.capacity() == id_capacity);
+    REQUIRE(table.descriptors.size() == 256);
+    REQUIRE(table.bound_ids.size() == 256);
     REQUIRE(table.LiveBoundIds().size() == 128);
     std::ranges::fill(table.bound_ids, untouched);
     REQUIRE(table.Read(memory, 127).second);

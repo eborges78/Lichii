@@ -25,6 +25,7 @@ struct Profile {
     bool support_int64{};
     bool support_vertex_instance_id{};
     bool support_float_controls{};
+    bool support_tensor_float16_rounding{};
     bool support_separate_denorm_behavior{};
     bool support_separate_rounding_mode{};
     bool support_fp16_denorm_preserve{};

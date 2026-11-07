@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -52,6 +54,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/renderer_vulkan/surface_clip_viewport.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -75,6 +78,9 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+
+// Shared by all PrepareDraw template instantiations and rasterizer instances.
+std::atomic_flag pre_task_capture_attempted{};
 
 /// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
 /// read as the GPU reads it, without flushing GPU caches.
@@ -253,6 +259,15 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
              device.IsPatchListPrimitiveRestartSupported()));
 }
 } // Anonymous namespace
+
+std::array<f32, 4> GetHostViewport0(const Device& device, const Maxwell& regs, bool is_rescaling) {
+    if (!regs.viewport_scale_offset_enabled) {
+        return GetSurfaceClipViewport(regs);
+    }
+    const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
+    const VkViewport viewport{GetViewportState(device, regs, 0, scale)};
+    return {viewport.x, viewport.y, viewport.width, viewport.height};
+}
 
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -478,6 +493,41 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    // One private buffer snapshot before the first matching task dispatch. Reuse the
+    // existing 4 MiB/binding capture path; no image readbacks are requested here.
+    static const u64 pre_task_hash = [] {
+        const char* value = std::getenv("EDEN_NX2_PRE_TASK_CAPTURE_HASH");
+        const char* dir = std::getenv("EDEN_NX2_PRE_TASK_CAPTURE_DIR");
+        if (!value && !dir) {
+            return u64{};
+        }
+        u64 hash{};
+        const std::string_view text = value ? value : "";
+        if (text.size() == 16 && dir && *dir) {
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), hash, 16);
+            if (result.ec == std::errc{} && result.ptr == text.data() + text.size() && hash != 0) {
+                return hash;
+            }
+        }
+        LOG_ERROR(Render_Vulkan, "Pre-task capture disabled: require a nonzero 16-digit hex hash and directory");
+        return u64{};
+    }();
+    if (pre_task_hash && mesh_draw && pipeline->ShaderHashes()[1] == pre_task_hash &&
+        !pre_task_capture_attempted.test_and_set(std::memory_order_relaxed)) {
+        if (frame_dump.BeginImmediateBuffers(std::getenv("EDEN_NX2_PRE_TASK_CAPTURE_DIR"))) {
+            LOG_INFO(Render_Vulkan, "Pre-task buffer capture before submission: hashes={:016x}",
+                     fmt::join(pipeline->ShaderHashes(), ","));
+            frame_dump.NoteDraw(pipeline->ShaderHashes());
+            FrameDumpBuffers(false, pipeline->ShaderHashes());
+            frame_dump.FinishImmediateBuffers();
+            // Finish submitted the command buffer containing Configure's bindings.
+            // Restore pipeline/descriptors/push constants in the new command buffer.
+            if (!pipeline->Configure(is_indexed)) {
+                report_failure("configure after pre-task capture failed");
+                return;
+            }
+        }
+    }
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
@@ -805,9 +855,19 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
-            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            static const bool trace = std::getenv("EDEN_NX2_MEMORY_TRACE") != nullptr;
+            scheduler.Record([this, groups = draw_params.num_vertices,
+                              hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
+                }
+                if (trace) {
+                    static u32 logged{};
+                    if (logged++ < 256) {
+                        LOG_INFO(Render_Vulkan,
+                                 "nx2 mesh dispatch first={:016x} last={:016x} groups=({},1,1)",
+                                 hashes.first, hashes.second, groups);
+                    }
                 }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
@@ -2498,19 +2558,12 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     maxwell3d->dirty.flags[Dirty::Scissors] = true;
 
     if (!regs.viewport_scale_offset_enabled) {
-        float x = static_cast<float>(regs.surface_clip.x);
-        float y = static_cast<float>(regs.surface_clip.y);
-        float width = (std::max)(1.0f, static_cast<float>(regs.surface_clip.width));
-        float height = (std::max)(1.0f, static_cast<float>(regs.surface_clip.height));
-        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            y += height;
-            height = -height;
-        }
+        const auto surface_viewport = GetSurfaceClipViewport(regs);
         VkViewport viewport{
-            .x = x,
-            .y = y,
-            .width = width,
-            .height = height,
+            .x = surface_viewport[0],
+            .y = surface_viewport[1],
+            .width = surface_viewport[2],
+            .height = surface_viewport[3],
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         };

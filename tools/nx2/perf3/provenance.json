@@ -1,0 +1,110 @@
+{
+  "base": "222877d4f7c8945b2f31a87b76d09f0a92e4f1b8",
+  "manifest": {
+    "schema_version": 1,
+    "base_commit": "222877d4f7c8945b2f31a87b76d09f0a92e4f1b8",
+    "series_status": "candidate-oot-perf3-2026-11-07",
+    "patches": [
+      {
+        "path": "patches/build95/integration-build95.patch",
+        "sha256": "5622904ad071af96d15af0dc898ed140c9d6b355d3c5c6b01f62008907f9ef12"
+      },
+      {
+        "path": "patches/oot-tensor-and-present-trace.patch",
+        "sha256": "5142c35f12afb7b407fd5536a3e20f8773006d69ac9a1149d1b4027dfa0f5f0e"
+      },
+      {
+        "path": "patches/xc2-build93-uniform-clamp.patch",
+        "sha256": "a74ddc463f53e38b663284c6c02c56cfd1b540498437d1dd142ce025fc90cc7b"
+      },
+      {
+        "path": "patches/oot-tensor-fp16-round.patch",
+        "sha256": "50fb911e470e2613a705a0d1f21f68428f5435b22b1c404cdbef66e1fee43acb"
+      },
+      {
+        "path": "patches/oot-tensor-fp16-precise.patch",
+        "sha256": "3d981c041aa23e5fa7649744d461acf07f2b83132fcf19948f30a29926ba1d28"
+      },
+      {
+        "path": "patches/oot-memory-diagnostics.patch",
+        "sha256": "18aff43921e832c7d611bd1b6983652b20b484f1017608f9b0336524f58aa3b1"
+      },
+      {
+        "path": "patches/oot-descriptor277-memory.patch",
+        "sha256": "116a1495fd3e23d37079a7a56c4aa3fe8ff8062d24ea149a896cad532aec0140"
+      },
+      {
+        "path": "patches/build95/oot-task684-initialize.patch",
+        "sha256": "427d215f967cdf04552b37e3494cbb405db555b1ccfdd459c3d91cc4c3e1497c"
+      },
+      {
+        "path": "patches/xc2-build93-d24-branch.patch",
+        "sha256": "47163dff6828dbd784062c9821c987934677f5629ce1b06f7241304195a95743"
+      },
+      {
+        "path": "patches/xc2-build93-d24-gpu-fixtures.patch",
+        "sha256": "46d806e47ac45201bb43976230df2eb16acf626f10d06af52da219957fa63c27"
+      },
+      {
+        "path": "patches/oot-fence-stop-wakeup.patch",
+        "sha256": "2c9b9cc5887951ff882fd032c9b3b41d864c16ff2100b464ba281ffc85a3d7f6"
+      },
+      {
+        "path": "patches/build95/oot-mesh-resources-trace.patch",
+        "sha256": "c94178e0a57a5a690466d81eb12d60c87b21cdaa4f7f4d00bc19512c7842cc62"
+      },
+      {
+        "path": "patches/oot-framebuffer-device-limit.patch",
+        "sha256": "f35ca160aa3a363125ccba615154a654bb20ad964ebe886face0ee84ca8b725a"
+      },
+      {
+        "path": "patches/build95/ally-pr276-multi-range-ownership-trace.patch",
+        "sha256": "da8cd4969c52a5e0f44481c1d9a10ce3d57c8b976705c324da8289a0d5017674"
+      },
+      {
+        "path": "patches/ally-pr276-gathered-request-trace.patch",
+        "sha256": "65f2d63de3ab7442be9cac2c44745c51547ff63abffcc6cc84b7103d4121b997"
+      },
+      {
+        "path": "patches/build95/oot-pre-task-buffer-capture.patch",
+        "sha256": "54821d86eab9b5dd0b9417c04772bdc0f8c5c2cfa8e3679c884058f85d9ce57e"
+      },
+      {
+        "path": "patches/xc2-depth-view-format-trace.patch",
+        "sha256": "33f96793b97b988db97832cf09c3492d26836bc3cadfc68cae362c72a5aec4db"
+      },
+      {
+        "path": "patches/oot18-small-integrated-texture-budget.patch",
+        "sha256": "f26577b3d4860c13489393d3241c3e5e6a8c4b65a12bade5853a456dbf83e35e"
+      },
+      {
+        "path": "patches/xc2-switch1-debug-present-clock-19.patch",
+        "sha256": "20b4a298898d9b7fcbcc90ed1ae76aab789d4d33b8a4fce7e89532c098326e6c"
+      },
+      {
+        "path": "patches/oot20-astc-collect-before-allocate.patch",
+        "sha256": "8062a09924a0d059f1c357c5cf57143ae2c94caec83b9a4cbe10594932d1cd5f"
+      },
+      {
+        "path": "patches/oot21-astc-bounded-backpressure.patch",
+        "sha256": "a988eaf224dc0a5f155e98f31f8e67790618af6313be864399b90a532112258b"
+      },
+      {
+        "path": "patches/build95/xc2-sparse-viewport-aspect-migration.patch",
+        "sha256": "b7d03b0aab6a9b54710c36b580158339c6921edf5e8c8cc0101505a723795f3a"
+      },
+      {
+        "path": "patches/oot-perf3-20261107.patch",
+        "sha256": "6d10be623bcdb7eacc8241f1b311f457dd31f2cd6d99ca930bb6a5fded842b65"
+      }
+    ],
+    "official_release_name": "Lichii nx2 build 95 (tag build-94)"
+  },
+  "feature_prs": {
+    "macro": "https://github.com/zortos293/Lichii/pull/491",
+    "collector": "https://github.com/zortos293/Lichii/pull/376",
+    "radv_cache": "https://github.com/Djihads80/Eglantine/pull/714",
+    "gpu_poll": "https://github.com/zortos293/Lichii/pull/446"
+  },
+  "status": "experimental, not installed; no performance gain claimed"
+}

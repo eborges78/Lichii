@@ -179,7 +179,12 @@ protected:
 
     virtual ~FenceManager() {
         if constexpr (can_async_check) {
-            fence_thread.request_stop();
+            {
+                // Serialize the stop predicate with the worker's transition into cv.wait.
+                // Otherwise notify_all can land after its false check but before it sleeps.
+                std::scoped_lock lock{guard};
+                fence_thread.request_stop();
+            }
             cv.notify_all();
             fence_thread.join();
         }

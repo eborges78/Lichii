@@ -7,8 +7,10 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "common/alignment.h"
@@ -24,7 +26,10 @@ namespace VideoCommon {
 template <typename T, typename Id = u32>
 class DescriptorTable {
 public:
-    [[nodiscard]] bool Synchronize(GPUVAddr gpu_addr, u32 limit) noexcept {
+    // Maxwell/Ampere SET_TEX_HEADER_POOL_C has a 22-bit maximum index (samplers use 20).
+    static constexpr u32 MaxDescriptorIndex = (1U << 22) - 1;
+
+    [[nodiscard]] bool Synchronize(GPUVAddr gpu_addr, u32 limit) {
         bool ret = !(current_gpu_addr == gpu_addr && current_limit == limit);
         if (ret) {
             Refresh(gpu_addr, limit);
@@ -73,18 +78,25 @@ public:
         return result;
     }
 
-    void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+    void Refresh(GPUVAddr gpu_addr, u32 limit) {
+        if (limit > MaxDescriptorIndex) {
+            throw std::out_of_range("Descriptor table limit exceeds the 22-bit hardware maximum");
+        }
         current_gpu_addr = gpu_addr;
         current_limit = limit;
-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+        // Round up geometrically to keep growth amortized without allocating 16 MiB for every
+        // small 32-byte descriptor table.
+        const size_t num_descriptors = std::bit_ceil(static_cast<size_t>(limit) + 1);
         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
         ClearReadDescriptors();
         invalidated = false;
         //
-        descriptors.resize(num_descriptors);
-        bound_ids.resize(num_descriptors, Id{0});
+        if (descriptors.size() < num_descriptors) {
+            descriptors.resize(num_descriptors);
+        }
+        if (bound_ids.size() < num_descriptors) {
+            bound_ids.resize(num_descriptors, Id{0});
+        }
     }
 
     std::vector<u64> read_descriptors;

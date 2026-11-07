@@ -320,13 +320,15 @@ class RescalingPushConstant {
 public:
     explicit RescalingPushConstant() noexcept {}
 
-    void PushTexture(bool is_rescaled) noexcept {
-        *texture_ptr |= is_rescaled ? texture_bit : 0u;
-        texture_bit <<= 1u;
-        if (texture_bit == 0u) {
-            texture_bit = 1u;
-            ++texture_ptr;
+    void PushTexture(bool is_rescaled, bool is_depth24 = false, bool point_depth24 = false) noexcept {
+        if (texture_index < Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS * 32) {
+            const u32 word = texture_index / 32;
+            const u32 bit = 1U << (texture_index % 32);
+            words[word] |= is_rescaled ? bit : 0;
+            depth24_words[word] |= is_depth24 ? bit : 0;
+            depth24_point_words[word] |= is_depth24 && point_depth24 ? bit : 0;
         }
+        ++texture_index;
     }
 
     void PushImage(bool is_rescaled) noexcept {
@@ -338,15 +340,19 @@ public:
         }
     }
 
+    const auto& Depth24Data() const noexcept { return depth24_words; }
+    const auto& Depth24PointData() const noexcept { return depth24_point_words; }
+
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {
         return words;
     }
 
 private:
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS> depth24_words{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS> depth24_point_words{};
+    u32 texture_index{};
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
-    u32* texture_ptr{words.data()};
     u32* image_ptr{words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS};
-    u32 texture_bit{1u};
     u32 image_bit{1u};
 };
 
@@ -367,22 +373,27 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     views += num_image_buffers;
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
+        bool is_depth24{};
+        bool point_depth24{};
         for (u32 index = 0; index < desc.count; ++index) {
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
+            is_depth24 = info.uses_depth24_fetch && desc.count == 1 &&
+                vk_image_view != VK_NULL_HANDLE && image_view.SamplesDepth24();
             if (vk_image_view == VK_NULL_HANDLE) {
                 const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+            point_depth24 = is_depth24 && sampler.SamplesSingleTexel(image_view);
             guest_descriptor_queue.AddSampledImage(vk_image_view,
                                                    sampler.HandleFor(image_view, desc.is_depth));
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
-        rescaling.PushTexture(is_rescaled);
+        rescaling.PushTexture(is_rescaled, is_depth24, point_depth24);
     }
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};

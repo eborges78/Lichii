@@ -409,6 +409,13 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
+    if (ctx.tensor_float16_rounding) {
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        return;
+    }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
         return;
@@ -437,7 +444,8 @@ void SetupSignedNanCapabilities(const Profile& profile, const IR::Program& progr
     if (profile.has_broken_fp16_float_controls && program.info.uses_fp16) {
         return;
     }
-    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve) {
+    if ((program.info.uses_fp16 || ctx.tensor_float16_rounding) &&
+        profile.support_fp16_signed_zero_nan_preserve) {
         ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
         ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
     }

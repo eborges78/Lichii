@@ -346,6 +346,21 @@ struct System::Impl {
     SystemResultStatus InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
+        // Recreate memory released after a Switch 2 game without reinitializing timing.
+        if (!device_memory) {
+            try {
+                device_memory.emplace();
+            } catch (const std::bad_alloc&) {
+                LOG_CRITICAL(Core, "Failed to allocate guest memory");
+            }
+            if (device_memory && !device_memory->buffer.BackingBasePointer()) {
+                device_memory.reset();
+            }
+            if (!device_memory) {
+                return SystemResultStatus::ErrorMemoryAllocation;
+            }
+        }
+
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
         if (!device_memory) {
@@ -566,6 +581,13 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+
+        // The guest RAM section keeps every page the game touched until it is destroyed (up to
+        // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
+        // InitializeKernel creates it again, sized for the next game.
+        if (Settings::CurrentProgramIsSwitch2()) {
+            device_memory.reset();
+        }
 
         LOG_DEBUG(Core, "Shutdown OK");
     }

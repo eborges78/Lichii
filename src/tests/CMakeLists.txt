@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/xbc2_cloud_candidate.cpp
     common/addon_config.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
@@ -24,6 +25,8 @@ add_executable(tests
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
+    video_core/texture_memory_thresholds.cpp
+    video_core/transcode_cache.cpp
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp

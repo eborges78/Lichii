@@ -12,6 +12,7 @@
 #endif
 #include <compare>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <string_view>
@@ -393,6 +394,38 @@ void UpdateRescalingInfo() {
     const auto setup = values.resolution_setup.GetValue();
     auto& info = values.resolution_info;
     TranslateResolutionInfo(setup, info);
+
+    static constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    const char* const oot_900p = std::getenv("EDEN_OOT_900P");
+    if (oot_900p == nullptr || std::string_view{oot_900p} == "0") {
+        return;
+    }
+    if (std::string_view{oot_900p} != "1") {
+        LOG_WARNING(Common, "Ignoring invalid EDEN_OOT_900P value '{}'; expected 0 or 1",
+                    oot_900p);
+        return;
+    }
+    if (GetCurrentProgramID() != OcarinaOfTimeProgramId || !IsDockedMode() ||
+        values.renderer_backend.GetValue() != RendererBackend::Vulkan ||
+        setup != ResolutionSetup::Res1X) {
+        LOG_WARNING(Common,
+                    "Ignoring EDEN_OOT_900P=1: requires Ocarina of Time, Docked mode, Vulkan, "
+                    "and 1X setup (title={:016X}, docked={}, backend={}, setup={})",
+                    GetCurrentProgramID(), IsDockedMode(),
+                    static_cast<u32>(values.renderer_backend.GetValue()),
+                    static_cast<u32>(setup));
+        return;
+    }
+
+    info.up_scale = 5;
+    info.down_shift = 3;
+    info.up_factor = 0.625f;
+    info.down_factor = 1.6f;
+    info.active = true;
+    info.downscale = true;
+    LOG_INFO(Common,
+             "Experimental OOT 900p override: scale 5/8 (0.625), mapping 2560x1440 to "
+             "1600x900; expected post-FSR output 1920x1080 requires capture verification");
 }
 
 u32 FrameGenMultiplier() {

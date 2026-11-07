@@ -46,6 +46,9 @@
 #endif
 
 namespace Vulkan {
+using Shader::Backend::SPIRV::HOST_VIEWPORT_LAYOUT_OFFSET;
+using Shader::Backend::SPIRV::DEPTH24_LAYOUT_OFFSET;
+using Shader::Backend::SPIRV::DEPTH24_POINT_LAYOUT_OFFSET;
 namespace {
 using boost::container::small_vector;
 using boost::container::static_vector;
@@ -296,6 +299,8 @@ GraphicsPipeline::GraphicsPipeline(
         if (!info) {
             continue;
         }
+        uses_host_viewport |= info->uses_host_viewport;
+        uses_depth24_fetch |= info->uses_depth24_fetch;
         stage_infos[stage] = *info;
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
@@ -698,6 +703,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
+        if (uses_host_viewport) {
+            host_viewport_words = GetHostViewport0(device, regs, texture_cache.IsRescaling());
+        }
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
@@ -795,7 +803,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, uses_viewport = uses_host_viewport,
+                      viewport_words = host_viewport_words, uses_depth24 = uses_depth24_fetch,
+                      depth24_words = rescaling.Depth24Data(),
+                      point_depth24_words = rescaling.Depth24PointData()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -814,6 +825,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                              : VK_SHADER_STAGE_ALL_GRAPHICS;
         cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                              sizeof(rescaling_data), rescaling_data.data());
+        if (uses_depth24) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, DEPTH24_LAYOUT_OFFSET,
+                                sizeof(depth24_words), depth24_words.data());
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, DEPTH24_POINT_LAYOUT_OFFSET,
+                                sizeof(point_depth24_words), point_depth24_words.data());
+        }
+        if (uses_viewport) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, HOST_VIEWPORT_LAYOUT_OFFSET,
+                                sizeof(viewport_words), viewport_words.data());
+        }
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
@@ -1257,8 +1278,25 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .pSpecializationInfo = nullptr,
         });
     }
+    if (static const bool trace = std::getenv("EDEN_NX2_MEMORY_TRACE") != nullptr; trace && is_mesh) {
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            if (spv_modules[stage]) {
+                LOG_INFO(Render_Vulkan,
+                         "nx2 mesh pipeline={:016x} slot={} hash={:016x} vk_stage={:#x} "
+                         "task={} mesh={} input_assembly=null tessellation=null",
+                         key.Hash(), stage + 1, key.unique_hashes[stage + 1],
+                         static_cast<u32>(StageFlag(stage_infos[stage],
+                             MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))),
+                         stage_infos[stage].is_task, stage_infos[stage].is_mesh);
+            }
+        }
+    }
+    static const bool memory_trace = std::getenv("EDEN_NX2_MEMORY_TRACE") != nullptr;
+    const bool trace_mesh_statistics = memory_trace && is_mesh &&
+                                      device.IsKhrPipelineExecutablePropertiesEnabled();
     VkPipelineCreateFlags flags{};
-    if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+    if (device.IsKhrPipelineExecutablePropertiesEnabled() &&
+        (Settings::values.renderer_debug.GetValue() || trace_mesh_statistics)) {
         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     }
     if (uses_descriptor_buffer) {
@@ -1293,6 +1331,45 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                        std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - trace_begin)
                            .count());
+
+    if (trace_mesh_statistics) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 128) {
+            const auto properties = device.GetLogical().GetPipelineExecutablePropertiesKHR(*pipeline);
+            for (u32 executable = 0; executable < properties.size(); ++executable) {
+                const auto& property = properties[executable];
+                LOG_INFO(Render_Vulkan,
+                         "nx2 mesh executable pipeline={:016x} index={} name={} stages={:#x} "
+                         "subgroup={}",
+                         key.Hash(), executable, property.name, static_cast<u32>(property.stages),
+                         property.subgroupSize);
+                const auto statistics = device.GetLogical().GetPipelineExecutableStatisticsKHR(
+                    *pipeline, executable);
+                for (const auto& statistic : statistics) {
+                    double value{};
+                    switch (statistic.format) {
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                        value = statistic.value.b32;
+                        break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                        value = static_cast<double>(statistic.value.i64);
+                        break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                        value = static_cast<double>(statistic.value.u64);
+                        break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                        value = statistic.value.f64;
+                        break;
+                    default:
+                        continue;
+                    }
+                    LOG_INFO(Render_Vulkan,
+                             "nx2 mesh statistic pipeline={:016x} index={} name={} value={}",
+                             key.Hash(), executable, statistic.name, value);
+                }
+            }
+        }
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

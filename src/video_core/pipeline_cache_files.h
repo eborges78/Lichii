@@ -13,8 +13,9 @@
 
 namespace VideoCommon {
 
-inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-inline constexpr u32 VulkanPipelineCacheVersion = 53;
+// The XC2 prototype emits experimental shaders and push constants. Keep its caches separate.
+inline constexpr u32 OpenGLPipelineCacheVersion = 0x58433201;
+inline constexpr u32 VulkanPipelineCacheVersion = 0x58433202;
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file

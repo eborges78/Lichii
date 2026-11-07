@@ -6,14 +6,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -52,6 +56,7 @@
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/surface.h"
+#include "video_core/xc2_cloud_policy.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -342,6 +347,25 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
                                  u64 shader_hash, size_t stage_index,
                                  std::span<const u32> reference = {}) {
+    if (static const bool trace = std::getenv("EDEN_NX2_MEMORY_TRACE") != nullptr;
+        trace && (program.info.is_task || program.info.is_mesh)) {
+        const auto& mesh = program.mesh;
+        const u64 attribute_words = std::max<u64>(
+            ((u64{mesh.max_vertices} + 31) / 32) * mesh.vertex_lines.size() * 32 +
+                ((u64{mesh.max_primitives} + 31) / 32) * mesh.primitive_lines.size() * 32,
+            1);
+        const u64 mesh_shared_bytes = program.info.is_mesh
+            ? 4 * (attribute_words + 4 + 3 * u64{mesh.max_primitives} + 1) : 0;
+        LOG_INFO(Render_Vulkan,
+                 "nx2 mesh resources hash={:016x} slot={} task={} mesh={} group=({},{},{}) "
+                 "payload_bytes={} max_vertices={} max_primitives={} topology={} "
+                 "vertex_lines={} primitive_lines={} guest_shared_bytes={} mesh_shared_bytes={}",
+                 shader_hash, stage_index + 1, program.info.is_task, program.info.is_mesh,
+                 program.workgroup_size[0], program.workgroup_size[1], program.workgroup_size[2],
+                 u64{mesh.payload_words} * 4, mesh.max_vertices, mesh.max_primitives, mesh.topology,
+                 mesh.vertex_lines.size(), mesh.primitive_lines.size(), program.shared_memory_size,
+                 mesh_shared_bytes);
+    }
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
     device.SaveShader(code);
@@ -385,6 +409,22 @@ struct DeferredStages {
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+    if (Settings::CurrentProgramIsSwitch2()) {
+        if (const char* value = std::getenv("EDEN_NX2_PIPELINE_WORKERS")) {
+            const std::string_view text{value};
+            size_t requested{};
+            const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), requested);
+            if (error == std::errc{} && end == text.data() + text.size() &&
+                requested >= 1 && requested <= max_core_threads) {
+                LOG_INFO(Render_Vulkan, "Nx2 memory: pipeline workers {} (automatic {})",
+                         requested, max_core_threads);
+                return requested;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "EDEN_NX2_PIPELINE_WORKERS={} invalid; expected 1..{}, using automatic count",
+                        text, max_core_threads);
+        }
+    }
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -424,6 +464,23 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
 }
 
 namespace {
+// Matches Mesa's boolean parsing of its environment options.
+bool EnvFlagSet(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string_view v{value};
+    for (const std::string_view truthy : {"1", "true", "t", "yes", "y"}) {
+        if (std::ranges::equal(v, truthy, [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. Eden's copy on top
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
@@ -433,6 +490,9 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_MESA_RADV:
+        // RADV uses Mesa's on-disk shader cache unless the user turns it off.
+        return !EnvFlagSet("MESA_SHADER_CACHE_DISABLE") && !EnvFlagSet("MESA_GLSL_CACHE_DISABLE");
     default:
         return false;
     }
@@ -459,6 +519,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
       background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+    if (Settings::values.use_vulkan_driver_pipeline_cache.GetValue() && !use_vulkan_pipeline_cache) {
+        LOG_INFO(Render_Vulkan, "Driver keeps its own pipeline cache, not saving a Vulkan one");
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -495,6 +558,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_int64 = device.IsShaderInt64Supported(),
         .support_vertex_instance_id = false,
         .support_float_controls = device.IsKhrShaderFloatControlsSupported(),
+        .support_tensor_float16_rounding =
+            Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
+            [] { const char* value = std::getenv("EDEN_NX2_TENSOR_FP16_ROUND");
+                 return value && std::string_view{value} == "1"; }() &&
+            device.IsFloat16Supported() && device.IsKhrShaderFloatControlsSupported() &&
+            float_control.shaderDenormPreserveFloat16 &&
+            float_control.shaderSignedZeroInfNanPreserveFloat16 &&
+            float_control.shaderRoundingModeRTEFloat16 &&
+            float_control.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE &&
+            float_control.roundingModeIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
         .support_separate_denorm_behavior =
             float_control.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
         .support_separate_rounding_mode =
@@ -574,6 +647,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
 
+    const bool xc2_cloud_candidate_title =
+        VideoCore::IsXenoblade2CloudCandidateTitle(Settings::GetCurrentProgramID());
     host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
@@ -599,8 +674,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
         .support_byte_addressed_r16 = true,
+        .experimental_position_varyings = xc2_cloud_candidate_title &&
+            (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+             driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE || driver_id == VK_DRIVER_ID_MESA_RADV) &&
+            std::getenv("EDEN_XBC2_POSITION_VARYING") != nullptr &&
+            std::string_view{std::getenv("EDEN_XBC2_POSITION_VARYING")} == "1",
+        .experimental_d24_fetch = xc2_cloud_candidate_title && !device.SupportsD24DepthBuffer() &&
+            std::getenv("EDEN_XBC2_D24_FETCH") != nullptr &&
+            std::string_view{std::getenv("EDEN_XBC2_D24_FETCH")} == "1",
     };
     host_info.ApplyDescriptorLimitPolicy();
+    if (host_info.experimental_position_varyings || host_info.experimental_d24_fetch) {
+        LOG_WARNING(Render_Vulkan, "Experimental XBC2 cloud candidate: position={} (1x only), D24 fetch={}",
+                    host_info.experimental_position_varyings, host_info.experimental_d24_fetch);
+    }
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
@@ -849,14 +936,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
-    constexpr std::array<char, 8> shader_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-    VideoCommon::CopyCompatiblePipelineCache(
-        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", 52), pipeline_cache_filename,
-        shader_magic, 52, CACHE_VERSION);
-    std::error_code migration_error;
-    std::filesystem::copy_file(VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", 52),
-                               used_pipelines_filename, std::filesystem::copy_options::none,
-                               migration_error);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
@@ -866,9 +945,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
-        VideoCommon::CopyCompatiblePipelineCache(
-            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", 52),
-            vulkan_pipeline_cache_filename, VULKAN_CACHE_MAGIC_NUMBER, 52, CACHE_VERSION);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
@@ -1349,6 +1425,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 return nullptr;
             }
         }
+    }
+    const bool triangle_fill =
+        (key.state.topology == Maxwell::PrimitiveTopology::Triangles ||
+         key.state.topology == Maxwell::PrimitiveTopology::TriangleStrip ||
+         key.state.topology == Maxwell::PrimitiveTopology::TriangleFan) &&
+        FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode) == Maxwell::PolygonMode::Fill;
+    if (host_info.experimental_position_varyings &&
+        Settings::values.resolution_info.up_factor == 1.0f && triangle_fill &&
+        !layer_source_program && key.unique_hashes[2] == 0 && key.unique_hashes[3] == 0 &&
+        key.unique_hashes[4] == 0 && uses_vertex_b && key.unique_hashes[5] != 0) {
+        Shader::Optimization::PositionVaryingPass(programs[1], programs[5]);
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;

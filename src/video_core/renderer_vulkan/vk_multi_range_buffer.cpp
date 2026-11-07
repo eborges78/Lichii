@@ -2,14 +2,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 
+#include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
+namespace {
+
+bool MemoryTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MEMORY_TRACE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+} // namespace
 
 MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     sparse_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -189,6 +202,8 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
         .handle = std::move(entry.sparse_handle),
         .gathered = std::move(entry.gathered),
         .tick = scheduler.CurrentTick(),
+        .size = entry.size,
+        .owner_count = entry.owners.size(),
     });
 }
 
@@ -200,6 +215,7 @@ void MultiRangeBufferCache::DrainRetired(Scheduler& scheduler) {
                 retired[index] = std::move(retired.back());
             }
             retired.pop_back();
+            ++released_count;
         } else {
             ++index;
         }
@@ -208,6 +224,84 @@ void MultiRangeBufferCache::DrainRetired(Scheduler& scheduler) {
 
 void MultiRangeBufferCache::TickFrame(Scheduler& scheduler) {
     DrainRetired(scheduler);
+    if (!MemoryTraceEnabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (last_memory_trace != std::chrono::steady_clock::time_point{} &&
+        now - last_memory_trace < std::chrono::seconds{1}) {
+        return;
+    }
+    last_memory_trace = now;
+    struct Totals {
+        u64 gathered_count{};
+        u64 gathered_requested_bytes{};
+        u64 sparse_count{};
+        u64 sparse_span_bytes{};
+        u64 owner_links{};
+
+        void Add(bool sparse, VkDeviceSize size, size_t owners) {
+            if (sparse) {
+                ++sparse_count;
+                sparse_span_bytes += size;
+            } else {
+                ++gathered_count;
+                gathered_requested_bytes += size;
+            }
+            owner_links += owners;
+        }
+    } active, pending;
+    for (const auto& [key, entry] : entries) {
+        active.Add(static_cast<bool>(entry.sparse_handle), entry.size, entry.owners.size());
+    }
+    for (const auto& entry : retired) {
+        pending.Add(static_cast<bool>(entry.handle), entry.size, entry.owner_count);
+    }
+    // Sparse spans alias source allocations; gathered sizes exclude VMA alignment/block slack.
+    LOG_INFO(Render_Vulkan,
+             "Nx2 multi-range memory: active_gathered={} active_gathered_requested_bytes={} "
+             "active_sparse={} active_sparse_span_bytes={} active_owner_links={} "
+             "retired_gathered={} retired_gathered_requested_bytes={} retired_sparse={} "
+             "retired_sparse_span_bytes={} retired_owner_links={} "
+             "created_gathered={} created_gathered_requested_bytes={} created_sparse={} "
+             "created_sparse_span_bytes={} released={}",
+             active.gathered_count, active.gathered_requested_bytes, active.sparse_count,
+             active.sparse_span_bytes, active.owner_links, pending.gathered_count,
+             pending.gathered_requested_bytes, pending.sparse_count, pending.sparse_span_bytes,
+             pending.owner_links, gathered_created_count, gathered_created_requested_bytes,
+             sparse_created_count, sparse_created_span_bytes, released_count);
+}
+
+void MultiRangeBufferCache::TraceGatheredRequest(VkDeviceSize size, size_t owners,
+                                               bool sparse_candidate) {
+    if (!MemoryTraceEnabled()) {
+        return;
+    }
+    constexpr u64 large_request = u64{64} << 20;
+    constexpr u64 cumulative_step = u64{256} << 20;
+    constexpr u32 max_events = 128;
+    constexpr u32 max_small_events = 8;
+    const u64 previous_bytes = gathered_requested_bytes;
+    ++gathered_request_count;
+    gathered_requested_bytes += size;
+    const bool large = size >= large_request;
+    const bool crossed_step = previous_bytes / cumulative_step !=
+                              gathered_requested_bytes / cumulative_step;
+    if (gathered_request_events >= max_events ||
+        (!large && (!crossed_step || small_gathered_request_events >= max_small_events))) {
+        return;
+    }
+    ++gathered_request_events;
+    if (!large) {
+        ++small_gathered_request_events;
+    }
+    // Before allocation: this reports a request, even if VMA fails or no frame completes.
+    LOG_INFO(Render_Vulkan,
+             "Nx2 gathered buffer request: requested_bytes={} owner_links={} requests={} "
+             "cumulative_requested_bytes={} sparse_enabled={} sparse_candidate={} "
+             "event={}/128 small_events={}/8",
+             size, owners, gathered_request_count, gathered_requested_bytes, use_sparse,
+             sparse_candidate, gathered_request_events, small_gathered_request_events);
 }
 
 MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& scheduler,
@@ -256,7 +350,8 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
     for (const MultiRangeSource& source : sources) {
         entry.owners.push_back(source.handle);
     }
-    if (CanBindSparse(sources)) {
+    const bool sparse_candidate = CanBindSparse(sources);
+    if (sparse_candidate) {
         entry.sparse_handle = CreateSparse(device, scheduler, sources, total);
     }
     if (!entry.sparse_handle) {
@@ -276,8 +371,16 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
+        TraceGatheredRequest(total, sources.size(), sparse_candidate);
         entry.gathered = memory_allocator.CreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
         entry.dirty = true;
+    }
+    if (entry.sparse_handle) {
+        ++sparse_created_count;
+        sparse_created_span_bytes += total;
+    } else {
+        ++gathered_created_count;
+        gathered_created_requested_bytes += total;
     }
     if (device.IsBufferDeviceAddressSupported()) {
         VkBuffer address_handle = *entry.sparse_handle;

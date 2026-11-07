@@ -270,6 +270,10 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
     }
+    ResetCapture(std::move(directory_));
+}
+
+void FrameDump::ResetCapture(std::filesystem::path directory_) {
     StopWriter();
     directory = std::move(directory_);
     truncated = false;
@@ -287,6 +291,61 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     if (start == std::chrono::steady_clock::time_point{}) {
         start = std::chrono::steady_clock::now();
     }
+}
+
+bool FrameDump::BeginImmediateBuffers(std::filesystem::path directory_) {
+    if (schedule.Busy()) {
+        LOG_WARNING(Render_Vulkan, "Pre-task buffer capture refused: another capture is pending or active");
+        return false;
+    }
+    std::error_code error;
+    const bool exists = std::filesystem::exists(directory_, error);
+    if (exists || error) {
+        LOG_ERROR(Render_Vulkan, "Pre-task buffer capture refused: directory exists or cannot be checked: {} ({})",
+                  directory_.string(), error.message());
+        return false;
+    }
+    // Also require successful creation here, so a path created between the check
+    // and this operation cannot have its old manifest truncated by StartCapture.
+    if (!std::filesystem::create_directories(directory_, error) || error) {
+        LOG_ERROR(Render_Vulkan, "Pre-task buffer capture refused: cannot create a new directory: {} ({})",
+                  directory_.string(), error.message());
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "Pre-task buffer capture phase=Begin dir={}", directory_.string());
+    // A completed frame's writer may still owe the debug server its capture ID.
+    // Join before replacing that ID in the schedule.
+    StopWriter();
+    if (!schedule.BeginImmediateBuffers()) {
+        return false;
+    }
+    ResetCapture(std::move(directory_));
+    immediate_buffers = StartCapture();
+    return immediate_buffers;
+}
+
+void FrameDump::FinishImmediateBuffers() {
+    if (!immediate_buffers) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Pre-task buffer capture phase=DrainBegin host_readbacks={} bytes={}",
+             readbacks.size(), pending_bytes);
+    // Submit pending uploads even when all captured buffers came from guest memory.
+    // Drain itself submits and waits when there are host-buffer readbacks.
+    if (readbacks.empty()) {
+        scheduler.Finish();
+    }
+    Drain();
+    LOG_INFO(Render_Vulkan, "Pre-task buffer capture phase=DrainDone");
+    Enqueue({.tags = fmt::format(R"("passes":0,"draws":{},"dispatches":0,"pre_task":true)", draws),
+             .summary = true,
+             .truncated = truncated});
+    // StopWriter drains the queue, closes the manifest, and joins before returning.
+    StopWriter();
+    schedule.Abort();
+    immediate_buffers = false;
+    LOG_INFO(Render_Vulkan, "Pre-task buffer capture phase=WriterDone persisted before draw: {}",
+             directory.string());
 }
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
@@ -863,6 +922,12 @@ void FrameDump::TickFrame() {
     case FrameDumpSchedule::Step::Start:
         break;
     }
+    StartCapture();
+}
+
+bool FrameDump::StartCapture() {
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
@@ -873,7 +938,7 @@ void FrameDump::TickFrame() {
                 id, {.error = fmt::format("cannot write {}", directory.generic_string())});
         }
         schedule.Abort();
-        return;
+        return false;
     }
     const u64 frame = schedule.Frame();
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
@@ -881,6 +946,7 @@ void FrameDump::TickFrame() {
     writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
              elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
+    return true;
 }
 
 void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
@@ -907,6 +973,19 @@ bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
     buffers = buffers_;
     trigger_frame = 0;
     capture_id = id;
+    return true;
+}
+
+bool FrameDumpSchedule::BeginImmediateBuffers() {
+    if (Busy()) {
+        return false;
+    }
+    enabled = true;
+    done = false;
+    sampled = false;
+    buffers = true;
+    capture_id = 0;
+    SetCapturing(true);
     return true;
 }
 
