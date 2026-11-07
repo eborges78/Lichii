@@ -57,6 +57,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <random>
+#include <string_view>
 #include <utility>
 
 #include "common/alignment.h"
@@ -1059,12 +1060,39 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
     if (length == 0 || backing_base == nullptr) {
         return;
     }
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+    // Private A/B experiment: read once per process, keeping the existing policy by default.
+    static const int advice = [] {
+        const char* value = std::getenv("EDEN_ALLY_COLD_HINT");
+        const std::string_view policy = value != nullptr ? value : "pageout";
+        int selected = MADV_PAGEOUT;
+        const char* name = "pageout";
+        if (policy == "off") {
+            selected = -1;
+            name = "off";
+        } else if (policy == "cold") {
+#ifdef MADV_COLD
+            selected = MADV_COLD;
+            name = "cold";
+#else
+            LOG_WARNING(Common_Memory, "MADV_COLD unavailable; using pageout");
+#endif
+        } else if (policy != "pageout") {
+            LOG_WARNING(Common_Memory, "Invalid EDEN_ALLY_COLD_HINT; using pageout");
+        }
+        LOG_INFO(Common_Memory, "Experimental Linux cold hint policy: {}", name);
+        return selected;
+    }();
+    if (advice == -1) {
+        return;
+    }
+#endif
     const auto hint = [length](u8* address) {
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.
         VirtualUnlock(address, length);
 #elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
+        madvise(address, length, advice);
 #else
         static_cast<void>(address);
 #endif

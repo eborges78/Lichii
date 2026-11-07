@@ -1,4 +1,4 @@
-name: Ally performance candidate
+name: Ally memory policy experiment
 on:
   push:
     branches: [ci/ally-perf3-20261107]
@@ -22,7 +22,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev libpulse-dev libtool libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build qt6-base-private-dev qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev ccache lld python3-venv libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          sudo apt-get install -y --no-install-recommends autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev libpulse-dev libtool libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build qt6-base-private-dev qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev ccache lld strace python3-venv libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
           python3 -m venv /tmp/xc2-cmake
           /tmp/xc2-cmake/bin/pip install cmake==3.31.6
           echo /tmp/xc2-cmake/bin >> "$GITHUB_PATH"
@@ -45,16 +45,6 @@ jobs:
           restore-keys: |
             ally-perf3-gcc13-
             xc2-linux-gcc13-qt683-v1
-      - name: Check public macro upload reductions with GCC 13
-        run: |
-          g++-13 -std=c++20 -O3 -Wall -Wextra -Werror tools/nx2/perf3/front-macro-baseline.cpp -o /tmp/front-macro-baseline
-          set +e
-          /tmp/front-macro-baseline
-          baseline_status=$?
-          set -e
-          echo "Baseline reduction exit: $baseline_status (inspect before attributing a compiler bug)"
-          g++-13 -std=c++20 -O3 -Wall -Wextra -Werror tools/nx2/perf3/front-macro-fixed.cpp -o /tmp/front-macro-fixed
-          /tmp/front-macro-fixed
       - name: Configure and build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_LINKER=/usr/bin/ld.lld -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DUSE_CCACHE=ON -DUSE_FASTER_LINKER=ON -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_TESTS=ON -DBUILD_TESTING=ON -DDYNARMIC_TESTS=OFF -DENABLE_WERROR=ON -DYUZU_USE_BUNDLED_SDL3=ON -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON -Dfmt_FORCE_BUNDLED=ON -DLICHII_BUILD_TAG=build-95-custom-perf3 -DLICHII_BUILD_PLATFORM=linux-x86_64
@@ -67,6 +57,19 @@ jobs:
           ctest --test-dir build --show-only=json-v1 > /tmp/xc2-tests.json
           python3 -c 'import json; t=json.load(open("/tmp/xc2-tests.json")); n={x["name"] for x in t["tests"]}; assert {"tests","sdl_window_state_tests","update_checker_tests","config_tests","compatibility_report"} <= n, n'
           ctest --test-dir build --output-on-failure --parallel 2 --timeout 180
+      - name: Verify real HostMemory policies using synthetic aliases
+        shell: bash
+        run: |
+          mkdir -p /tmp/ally-cold-hints
+          for policy in unset pageout cold off invalid; do
+            if [ "$policy" = unset ]; then
+              env -u EDEN_ALLY_COLD_HINT strace -qq -f -e trace=madvise -o "/tmp/ally-cold-hints/$policy.strace" build/bin/tests '[host_memory_cold_hint]'
+            else
+              env EDEN_ALLY_COLD_HINT="$policy" strace -qq -f -e trace=madvise -o "/tmp/ally-cold-hints/$policy.strace" build/bin/tests '[host_memory_cold_hint]'
+            fi
+          done
+          python3 tools/nx2/perf3/verify_cold_hints.py /tmp/ally-cold-hints
+          ccache --show-stats
       - name: Validate exported synthetic SPIR-V
         shell: bash
         run: |
@@ -82,12 +85,23 @@ jobs:
           name: xc2-test-log
           path: build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
-      - name: Save candidate binary and macro object
+      - name: Preserve public memory syscall traces
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ally-perf3-linux
+          name: ally-pageout-synthetic-traces
+          path: /tmp/ally-cold-hints/*.strace
+          if-no-files-found: ignore
+      - name: Require memory object and binary
+        run: |
+          test -s build/bin/lichii
+          test -s build/src/common/CMakeFiles/common.dir/host_memory.cpp.o
+      - name: Save memory experiment binary and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: ally-pageout-linux
           path: |
             build/bin/lichii
-            build/src/video_core/CMakeFiles/video_core.dir/engines/maxwell_3d.cpp.o
+            build/src/common/CMakeFiles/common.dir/host_memory.cpp.o
             tools/nx2/perf3/provenance.json
           retention-days: 7

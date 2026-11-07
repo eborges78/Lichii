@@ -3,7 +3,7 @@
   "manifest": {
     "schema_version": 1,
     "base_commit": "222877d4f7c8945b2f31a87b76d09f0a92e4f1b8",
-    "series_status": "candidate-oot-perf3-2026-11-07",
+    "series_status": "private-cold-hint-policy-experiment-2026-11-07",
     "patches": [
       {
         "path": "patches/build95/integration-build95.patch",
@@ -96,6 +96,10 @@
       {
         "path": "patches/oot-perf3-20261107.patch",
         "sha256": "6d10be623bcdb7eacc8241f1b311f457dd31f2cd6d99ca930bb6a5fded842b65"
+      },
+      {
+        "path": "patches/oot-linux-cold-hint-experiment-20261107.patch",
+        "sha256": "d2d9adb321969997d8e7e4caa9338689feda5c42334a646eacb9c72f539d1915"
       }
     ],
     "official_release_name": "Lichii nx2 build 95 (tag build-94)"
@@ -106,5 +110,17 @@
     "radv_cache": "https://github.com/Djihads80/Eglantine/pull/714",
     "gpu_poll": "https://github.com/zortos293/Lichii/pull/446"
   },
-  "status": "experimental, not installed; no performance gain claimed"
+  "status": "experimental memory policy modes; not installed or performance validated",
+  "experiment": {
+    "environment": "EDEN_ALLY_COLD_HINT",
+    "modes": [
+      "pageout",
+      "cold",
+      "off"
+    ],
+    "default": "pageout",
+    "baseline_commit": "c08f58ff58127457e8d6179a3f0da8d76d467d45",
+    "origin": "https://github.com/Djihads80/Eglantine/pull/196",
+    "scope": "Private memory-policy A/B only; no claimed gain or production activation."
+  }
 }

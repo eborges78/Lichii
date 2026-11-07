@@ -82,6 +82,49 @@ TEST_CASE("HostMemory: Simple mirror map", "[common]") {
     REQUIRE(mirror_a[0x1000] == 76);
 }
 
+#ifdef __linux__
+TEST_CASE("HostMemory: Cold hints preserve backing and aliases",
+          "[common][host_memory_cold_hint]") {
+    // Run this case in a fresh process per policy; strace can check the four 196608-byte
+    // madvise calls (or none for off), independently of the content checks below.
+    constexpr size_t length = 0x30000;
+    constexpr size_t physical = 0x10000;
+    constexpr size_t first_view = 0x40000;
+    constexpr size_t second_view = 0x80000;
+    HostMemory mem{1_MiB, 4_MiB};
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    REQUIRE(mem.VirtualBasePointer() != nullptr);
+    mem.Map(first_view, physical, length, PERMS, HEAP);
+    mem.Map(second_view, physical, length, PERMS, HEAP);
+
+    volatile u8* const backing = mem.BackingBasePointer() + physical;
+    volatile u8* const first = mem.VirtualBasePointer() + first_view;
+    volatile u8* const second = mem.VirtualBasePointer() + second_view;
+    const auto pattern = [](size_t i) { return static_cast<u8>(i * 73 + (i >> 8)); };
+    const auto contents_match = [&](u8 mask) {
+        for (size_t i = 0; i < length; ++i) {
+            const u8 expected = static_cast<u8>(pattern(i) ^ mask);
+            if (backing[i] != expected || first[i] != expected || second[i] != expected) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (size_t i = 0; i < length; ++i) {
+        first[i] = pattern(i);
+    }
+    REQUIRE(contents_match(0));
+    mem.HintCold(physical, length, first_view);
+    REQUIRE(contents_match(0));
+
+    for (size_t i = 0; i < length; ++i) {
+        second[i] = static_cast<u8>(pattern(i) ^ 0xff);
+    }
+    mem.HintCold(physical, length, second_view);
+    REQUIRE(contents_match(0xff));
+}
+#endif
+
 TEST_CASE("HostMemory: Simple unmap", "[common]") {
     if (!MapsSingleGuestPages()) {
         SKIP("Host pages larger than 4 KiB only map whole host pages");
