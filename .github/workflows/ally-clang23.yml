@@ -1,0 +1,123 @@
+name: Ally Clang23 PGO ThinLTO candidate
+on:
+  push:
+    branches: [ci/ally-clang23-20261107]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: /tmp/ally-clang23-ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Checkout exact candidate code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact source commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev libpulse-dev libtool libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build qt6-base-private-dev qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev ccache lld python3-venv libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          python3 -m venv /tmp/xc2-cmake
+          /tmp/xc2-cmake/bin/pip install cmake==3.31.6
+          echo /tmp/xc2-cmake/bin >> "$GITHUB_PATH"
+      - name: Install LLVM 23 from official signed repository
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-23 lld-23 llvm-23
+          clang-23 --version
+          llvm-profdata-23 --version
+      - name: Audit public PGO input
+        run: |
+          mkdir -p /tmp/ally-clang-evidence
+          echo '2d769a1adadc4d911295e540229d1b01e7cb01f379fabcc3e7051e1ed8647144  eglantine.profdata' | sha256sum -c -
+          llvm-profdata-23 show --topn=30 eglantine.profdata > /tmp/ally-clang-evidence/profile-summary.txt
+          llvm-profdata-23 show --all-functions eglantine.profdata | llvm-cxxfilt-23 > /tmp/ally-clang-evidence/profile-functions.txt
+          cat /tmp/ally-clang-evidence/profile-summary.txt
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+      - name: Restore dependency and compiler caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cpm
+            /tmp/ally-clang23-ccache
+          key: ally-clang23-pgo-thinlto-v1-${{ github.sha }}
+          restore-keys: |
+            ally-clang23-pgo-thinlto-v1-
+      - name: Configure and build exact perf3 source with PGO and ThinLTO
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="-fprofile-use=$PWD/eglantine.profdata -Wno-error=profile-instr-unprofiled -Wno-error=profile-instr-out-of-date -Wno-error=backend-plugin"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_LINKER=/usr/bin/ld.lld-23 -DCMAKE_AR=/usr/bin/llvm-ar-23 -DCMAKE_RANLIB=/usr/bin/llvm-ranlib-23 -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DUSE_CCACHE=ON -DUSE_FASTER_LINKER=OFF -DENABLE_LTO=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_TESTS=ON -DBUILD_TESTING=ON -DDYNARMIC_TESTS=OFF -DENABLE_WERROR=ON -DYUZU_USE_BUNDLED_SDL3=ON -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON -Dfmt_FORCE_BUNDLED=ON -DLICHII_BUILD_TAG=build-95-perf3-clang23-pgo-thinlto -DLICHII_BUILD_PLATFORM=linux-x86_64 "-DCMAKE_C_FLAGS=$profile" "-DCMAKE_CXX_FLAGS=$profile" "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-23/bin -fuse-ld=lld -Wl,--thinlto-jobs=2"
+          python3 - <<'PYVERIFY'
+          import json
+          from pathlib import Path
+          commands = json.loads(Path('build/compile_commands.json').read_text())
+          kernel = [c for c in commands if c['file'].endswith('/hle/kernel/kernel.cpp')]
+          assert len(kernel) == 1, kernel
+          command = kernel[0]['command']
+          assert '-flto=thin' in command and command.rfind('-fno-lto') > command.rfind('-flto=thin'), command
+          others = [c for c in commands if c['file'].endswith('/video_core/engines/maxwell_3d.cpp')]
+          assert len(others) == 1 and '-flto=thin' in others[0]['command'], others
+          Path('/tmp/ally-clang-evidence/kernel-command.json').write_text(json.dumps(kernel, indent=2))
+          PYVERIFY
+          cmake --build build --parallel 4 2>&1 | tee /tmp/ally-clang-evidence/build.log
+          sha256sum build/bin/lichii > /tmp/ally-clang-evidence/binary.sha256
+          git rev-parse HEAD > /tmp/ally-clang-evidence/source.txt
+          cp build/CMakeCache.txt /tmp/ally-clang-evidence/
+      - name: Run complete discovered test suites
+        env:
+          QT_QPA_PLATFORM: offscreen
+          XBC2_TEST_SPIRV_DIR: /tmp/xc2-synthetic-spirv
+        run: |
+          ctest --test-dir build --show-only=json-v1 > /tmp/xc2-tests.json
+          python3 -c 'import json; t=json.load(open("/tmp/xc2-tests.json")); n={x["name"] for x in t["tests"]}; assert {"tests","sdl_window_state_tests","update_checker_tests","config_tests","compatibility_report"} <= n, n'
+          ctest --test-dir build --output-on-failure --parallel 2 --timeout 180
+      - name: Validate exported synthetic SPIR-V
+        shell: bash
+        run: |
+          shopt -s nullglob
+          modules=(/tmp/xc2-synthetic-spirv/*.spv)
+          test "${#modules[@]}" -gt 0
+          for module in "${modules[@]}"; do spirv-val --target-env vulkan1.1 "$module"; done
+          printf 'Validated %s synthetic modules\n' "${#modules[@]}"
+      - name: Preserve compiler and profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ally-clang23-evidence
+          path: /tmp/ally-clang-evidence
+          if-no-files-found: error
+      - name: Preserve test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xc2-test-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+      - name: Save candidate binary and macro object
+        uses: actions/upload-artifact@v4
+        with:
+          name: ally-clang23-linux
+          path: |
+            build/bin/lichii
+            build/src/video_core/CMakeFiles/video_core.dir/engines/maxwell_3d.cpp.o
+            tools/nx2/perf3/provenance.json
+          retention-days: 7
