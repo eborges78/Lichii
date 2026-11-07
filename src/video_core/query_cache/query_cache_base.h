@@ -86,6 +86,13 @@ public:
         return mask;
     }
 
+    // Pending or written-but-still-listed reports prevent a split-front snapshot hit.
+    [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
+        bool result = false;
+        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
+        return result;
+    }
+
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
         bool result = false;

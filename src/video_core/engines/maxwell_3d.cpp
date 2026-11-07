@@ -7,10 +7,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1043,6 +1046,12 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    std::unordered_map<u64, u64> dma_snapshots; // device page -> writer stamp, at most 1024
+    u64 snapshot_mapping{};
+    u64 snapshot_hits{};
+    u64 snapshot_misses{};
+    u64 snapshot_mismatches{};
+    std::chrono::steady_clock::time_point snapshot_report{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
 };
@@ -1135,6 +1144,41 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+VideoCommon::DmaSnapshotWrite Maxwell3D::FrontSnapshotWrite(const FrontState& fs, u32 method,
+                                                           u32 amount) const {
+    // Even a register write can issue a deferred draw. All executable methods stay opaque,
+    // except bounded constant-buffer writes whose device page is known (Frizti/#345).
+    if (fs.draw_pending || fs.control == Regs::ShadowRamControl::Replay) {
+        return {};
+    }
+    if (!execution_mask[method]) {
+        return {.known = true};
+    }
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    if (method < cb_data || method >= cb_data + 16) {
+        return {};
+    }
+    const u64 offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+    const u64 size = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    const u64 bytes = u64{amount} * sizeof(u32);
+    const GPUVAddr base =
+        (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+    if (offset > std::numeric_limits<GPUVAddr>::max() - base) {
+        return {};
+    }
+    const GPUVAddr address = base + offset;
+    if (bytes == 0 || offset > size || bytes > size - offset || bytes > 4096 ||
+        (address & 4095) + bytes > 4096) {
+        return {};
+    }
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device || memory_manager.GpuToCpuAddress(address + bytes - 1) != *device + bytes - 1) {
+        return {};
+    }
+    return {.known = true, .begin = *device, .size = bytes};
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1161,6 +1205,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         return;
     }
+    const auto snapshot_write = split.DmaSnapshotMode() != 0
+                                    ? FrontSnapshotWrite(fs, method, 1)
+                                    : VideoCommon::DmaSnapshotWrite{};
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
         // writes, and the shadow RAM (tracked by default) holds the value already.
@@ -1209,9 +1256,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
     }
     if (from_macro) {
-        split.MacroWrite(this, method, argument);
+        split.MacroWrite(this, method, argument, snapshot_write);
     } else {
-        split.Method(this, method, argument, is_last_call, nullptr);
+        split.Method(this, method, argument, is_last_call, nullptr, snapshot_write);
     }
 }
 
@@ -1245,6 +1292,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    const auto snapshot_write = split.DmaSnapshotMode() != 0
+                                    ? FrontSnapshotWrite(fs, method, amount)
+                                    : VideoCommon::DmaSnapshotWrite{};
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1319,7 +1369,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, snapshot_write);
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1424,6 +1474,88 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
+    // Frizti 8ac3666f: certify pages after a drained read, then read live RAM again while
+    // no queued writer can have changed them. Unlike that branch, draws invalidate globally.
+    const int snapshot_mode = split.DmaSnapshotMode();
+    u64 mapping{};
+    GPUVAddr page_begin{};
+    GPUVAddr page_end{};
+    std::optional<DAddr> device_begin;
+    static const bool force_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
+    bool snapshot_eligible = snapshot_mode != 0 && method == 0x158 && words != 0 &&
+                             !Tegra::Nx2CmdPageDiag::g_enabled &&
+                             !VideoCommon::QueryDma::TraceEnabled() &&
+                             !force_drain;
+    if (snapshot_eligible) {
+        mapping = memory_manager.MappingGeneration();
+        page_begin = source & ~GPUVAddr{4095};
+        page_end = (source + read_bytes + 4095) & ~GPUVAddr{4095};
+        if (fs.snapshot_mapping != mapping) {
+            fs.dma_snapshots.clear();
+            fs.snapshot_mapping = mapping;
+        }
+        // Certify every page, including its end: checking only the two ends of a multi-page
+        // mapping would miss a hole or an alias in the middle.
+        device_begin = memory_manager.GpuToCpuAddress(page_begin);
+        snapshot_eligible = device_begin && (*device_begin & 4095) == 0;
+        for (GPUVAddr page = page_begin; snapshot_eligible && page < page_end; page += 4096) {
+            const DAddr expected = *device_begin + (page - page_begin);
+            snapshot_eligible = memory_manager.GpuToCpuAddress(page) == expected &&
+                                memory_manager.GpuToCpuAddress(page + 4095) == expected + 4095;
+        }
+        snapshot_eligible &= mapping == memory_manager.MappingGeneration();
+    }
+    const auto report_snapshot = [&] {
+        if (snapshot_mode == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= fs.snapshot_report) {
+            fs.snapshot_report = now + std::chrono::seconds{5};
+            LOG_INFO(HW_GPU, "DMA snapshot mode {}: hits={} misses={} mismatches={} pages={}",
+                     snapshot_mode, fs.snapshot_hits, fs.snapshot_misses, fs.snapshot_mismatches,
+                     fs.dma_snapshots.size());
+        }
+    };
+    std::span<const u32> verify_words;
+    if (snapshot_eligible) {
+        const DAddr device = *device_begin + (source - page_begin);
+        bool hit = true;
+        for (u64 page = *device_begin / 4096; page < (*device_begin + page_end - page_begin) / 4096;
+             ++page) {
+            const auto found = fs.dma_snapshots.find(page);
+            if (found == fs.dma_snapshots.end() ||
+                split.DmaSnapshotWrites().ChangedSince(found->second, device, read_bytes)) {
+                hit = false;
+                break;
+            }
+        }
+        // Reports can land after ring consumption. Include a report whose timestamp overlaps
+        // the read even when its payload starts up to 12 bytes earlier (Frizti's guard).
+        const DAddr query_begin = device >= 12 ? device - 12 : 0;
+        if (hit && rasterizer->HasCachedReports(query_begin, read_bytes + device - query_begin)) {
+            hit = false;
+        }
+        if (hit && mapping == memory_manager.MappingGeneration()) {
+            thread_local std::vector<u32> snapshot_words;
+            snapshot_words.resize(words);
+            memory_manager.ReadBlockUnsafe(source, snapshot_words.data(), read_bytes);
+            if (mapping == memory_manager.MappingGeneration()) {
+                ++fs.snapshot_hits;
+                if (snapshot_mode == 9) {
+                    fs.parameters.insert(fs.parameters.end(), snapshot_words.begin(), snapshot_words.end());
+                    report_snapshot();
+                    return;
+                }
+                verify_words = snapshot_words;
+            } else {
+                snapshot_eligible = false;
+                ++fs.snapshot_misses;
+            }
+        } else {
+            ++fs.snapshot_misses;
+        }
+    }
     std::vector<u32> diag_before;
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         diag_before.resize(words);
@@ -1445,10 +1577,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+    const GPUVAddr flush_begin = snapshot_eligible ? page_begin : source;
+    const size_t flush_bytes = snapshot_eligible ? page_end - page_begin : read_bytes;
+    if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes, VideoCommon::CacheType::BufferCache)) {
         split.Run(
-            [memory = &memory_manager, source, read_bytes] {
-                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            [memory = &memory_manager, flush_begin, flush_bytes] {
+                memory->FlushRegion(flush_begin, flush_bytes, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     }
@@ -1459,8 +1593,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         },
         VideoCommon::DrainSite::MacroDmaFlush);
     u32 changed{};
+    bool snapshot_mismatch = false;
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        if (!verify_words.empty() && verify_words[i] != word) {
+            snapshot_mismatch = true;
+        }
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
@@ -1470,6 +1608,25 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             ++changed;
         }
     }
+    if (snapshot_mismatch) {
+        ++fs.snapshot_mismatches;
+        if (fs.snapshot_mismatches <= 8) {
+            LOG_WARNING(HW_GPU, "DMA snapshot verification mismatch {}; using drained values",
+                        fs.snapshot_mismatches);
+        }
+    }
+    if (snapshot_eligible && mapping == memory_manager.MappingGeneration()) {
+        constexpr size_t max_pages = 1024;
+        const size_t pages = (page_end - page_begin) / 4096;
+        if (fs.dma_snapshots.size() + pages > max_pages) {
+            fs.dma_snapshots.clear();
+        }
+        const u64 stamp = split.DmaSnapshotWrites().Stamp();
+        for (size_t page = 0; page < pages; ++page) {
+            fs.dma_snapshots[*device_begin / 4096 + page] = stamp;
+        }
+    }
+    report_snapshot();
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         bool gpu_written = false;
         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {

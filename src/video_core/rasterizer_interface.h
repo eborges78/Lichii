@@ -134,6 +134,11 @@ public:
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
     /// Whether reports in the range wait for host query results not yet in guest memory.
+    [[nodiscard]] virtual bool HasCachedReports([[maybe_unused]] DAddr addr,
+                                                [[maybe_unused]] u64 size) {
+        return true; // A backend without a front-safe lookup cannot certify a snapshot.
+    }
+
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {
         return false;

@@ -114,6 +114,23 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return;
     }
     system = &system_;
+    static const int snapshot_mode = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_SNAPSHOT");
+        if (value == nullptr || std::strcmp(value, "0") == 0) {
+            return 0;
+        }
+        if (std::strcmp(value, "9") == 0) {
+            return 9;
+        }
+        if (std::strcmp(value, "10") == 0) {
+            return 10;
+        }
+        LOG_WARNING(HW_GPU, "Invalid EDEN_NX2_DMA_SNAPSHOT; using 0 (off)");
+        return 0;
+    }();
+    dma_snapshot_mode = snapshot_mode;
+    dma_snapshot_writes.Reset();
+    LOG_INFO(HW_GPU, "DMA snapshot mode {} (0 off, 9 on, 10 verify)", snapshot_mode);
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
@@ -139,6 +156,8 @@ void GpuSplit::Stop() {
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
     write_position = 0;
+    dma_snapshot_writes.Reset();
+    dma_snapshot_mode = 0;
     last_writer_position = 0;
     last_sync_position = 0;
     published_local = 0;
@@ -283,7 +302,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           DmaSnapshotWrite snapshot_write) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -300,7 +320,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         }
         entry[size - 1] = 0;
         std::memcpy(entry + head, words, size_t{piece} * sizeof(u32));
-        Commit(size);
+        Commit(size, snapshot_write);
         words += piece;
         amount -= piece;
         methods_pending -= piece;

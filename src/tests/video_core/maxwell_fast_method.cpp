@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <random>
@@ -38,6 +39,11 @@ struct GpuSplitTestAccess {
         split.consumed_cache = position;
         split.published_local = position;
         split.publish_every = GpuSplit::RingWords;
+    }
+
+    static void EnableDmaSnapshots(GpuSplit& split, int mode = 10) {
+        split.dma_snapshot_mode = mode;
+        split.dma_snapshot_writes.Reset();
     }
 
     static u64 End(const GpuSplit& split) {
@@ -689,6 +695,7 @@ TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queu
 
     VideoCommon::GpuSplit split;
     Access::Start(split, f.system);
+    Access::EnableDmaSnapshots(split);
     SCOPE_EXIT { split.Stop(); };
     const auto state = [&](u32 method, u32 value) {
         split.Method(&f.fast, method, value, true, nullptr);
@@ -714,14 +721,29 @@ TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queu
     REQUIRE(f.memory.Read<u32>(alias + 4) == 20);
     REQUIRE(f.memory.Read<u32>(gpu_address + 0x1000) == 50);
 
+    // A snapshot certifies completed GPU work, not a copy of RAM: CPU updates remain visible
+    // through both GPU aliases without another writer record.
+    const u64 ready = split.DmaSnapshotWrites().Stamp();
+    const u32 cpu_value = 123;
+    std::memcpy(backing + 8, &cpu_value, sizeof(cpu_value));
+    REQUIRE_FALSE(split.DmaSnapshotWrites().ChangedSince(ready, device_address + 8, 4));
+    REQUIRE(f.memory.Read<u32>(gpu_address + 8) == cpu_value);
+    REQUIRE(f.memory.Read<u32>(alias + 8) == cpu_value);
+    const u64 mapping = f.memory.MappingGeneration();
     split.Defer([&] {
         f.memory.Map(alias, device_address + 0x1000, 0x1000, Tegra::PTEKind::PITCH, false);
     });
+    REQUIRE(split.DmaSnapshotWrites().ChangedSince(ready, device_address, 4));
     upload(alias, 4, {70});
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     REQUIRE(f.memory.Read<u32>(gpu_address) == 1);
     REQUIRE(f.memory.Read<u32>(gpu_address + 0x1000) == 70);
     REQUIRE(f.memory.Read<u32>(alias + 4) == 60);
+    REQUIRE(f.memory.MappingGeneration() > mapping);
+    const u64 before_stop = split.DmaSnapshotWrites().Stamp();
+    split.Stop();
+    REQUIRE(split.DmaSnapshotMode() == 0);
+    REQUIRE(split.DmaSnapshotWrites().ChangedSince(before_stop, device_address, 4));
 }
 
 TEST_CASE("Split consumption does not complete deferred downstream callbacks",
@@ -816,3 +838,266 @@ TEST_CASE("Maxwell3D keeps state written after the split stops over the front's 
     CHECK(engine.shadow_state.reg_array[state] == 0x5678);
     CHECK(engine.regs.reg_array[state] == 0x5678);
 }
+
+TEST_CASE("Every split entry is an unknown DMA snapshot writer unless explicitly classified",
+          "[video_core][dma_snapshot][gpu_split_dispatch]") {
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    VideoCommon::GpuSplitTestAccess::Initialize(split, f.system);
+    VideoCommon::GpuSplitTestAccess::EnableDmaSnapshots(split);
+    constexpr u32 method = Maxwell3D::RootTables::SelectMethod;
+    constexpr VideoCommon::DmaSnapshotWrite no_write{.known = true};
+    split.Method(&f.fast, method, 0, true, nullptr, no_write); // engine selection invalidates
+    const auto& writes = split.DmaSnapshotWrites();
+    auto stamp = writes.Stamp();
+    split.Method(&f.fast, method, 0, true, nullptr, no_write);
+    split.MacroWrite(&f.fast, method, 0, no_write);
+    const std::array<u32, 2> arguments{0, 0};
+    split.MultiMethod(&f.fast, method, arguments.data(), 2, 2, nullptr, no_write);
+    REQUIRE_FALSE(writes.ChangedSince(stamp, 0x4000, 4));
+
+    split.Method(&f.fast, method, 0, true, nullptr,
+                 {.known = true, .begin = 0x8000, .size = 4});
+    REQUIRE_FALSE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp, 0x8000, 4));
+    stamp = writes.Stamp();
+    split.Method(&f.fast, method, 0, true, nullptr);
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    stamp = writes.Stamp();
+    split.MacroWrite(&f.fast, method, 0);
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    stamp = writes.Stamp();
+    split.MultiMethod(&f.fast, method, arguments.data(), 2, 2, nullptr);
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    stamp = writes.Stamp();
+    split.Defer([] {});
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    stamp = writes.Stamp();
+    bool called = false;
+    split.DeferFunction([&called] { called = true; });
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    stamp = writes.Stamp();
+    split.Method(&f.slow, method, 0, true, nullptr, no_write); // another engine/channel
+    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+
+    // Execute real ring entries too, including freeing DeferFunction's owned callback.
+    const auto end = VideoCommon::GpuSplitTestAccess::End(split);
+    for (u64 pos = 0; pos < end;) {
+        pos = VideoCommon::GpuSplitTestAccess::Execute(split, pos, end);
+    }
+    REQUIRE(called);
+}
+
+#ifdef ARCHITECTURE_x86_64
+namespace {
+class SnapshotRasterizer final : public VideoCore::RasterizerInterface {
+public:
+    std::atomic<u32> query_flushes{};
+    std::atomic<bool> buffer_dirty{true};
+    DAddr flushed_begin{};
+    u64 flushed_bytes{};
+    std::atomic<u32> query_checks{};
+    std::atomic<bool> report_pending{};
+    u8* change_on_flush{};
+    u32 replacement{};
+    bool HasCachedReports(DAddr, u64) override {
+        ++query_checks;
+        return report_pending.load();
+    }
+    void FlushQueryResults(DAddr, u64) override {
+        ++query_flushes;
+        report_pending.store(false);
+        if (change_on_flush) {
+            std::memcpy(change_on_flush, &replacement, sizeof(replacement));
+            change_on_flush = nullptr;
+        }
+    }
+    void Draw(bool, u32) override {}
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&) override {}
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr begin, u64 bytes, VideoCommon::CacheType which) override {
+        if (True(which & VideoCommon::CacheType::BufferCache)) {
+            flushed_begin = begin;
+            flushed_bytes = bytes;
+            buffer_dirty.store(false);
+        }
+    }
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType which) override {
+        return True(which & VideoCommon::CacheType::BufferCache) && buffer_dirty.load();
+    }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, false};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override {
+        return false;
+    }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
+        std::terminate();
+    }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+};
+
+std::array<u32, 3> SnapshotFifoInstruction(u32 method, bool end) {
+    std::array<u32, 3> bits{};
+    const auto field = [&](u32 offset, u32 count, u32 value) {
+        for (u32 bit = 0; bit < count; ++bit) {
+            bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
+        }
+    };
+    field(0, 1, end);
+    for (u32 lane = 0; lane < 2; ++lane) {
+        field(15 + lane * 36, 5, 24);
+        field(20 + lane * 36, 5, 24);
+        field(25 + lane * 36, 5, 24);
+    }
+    field(30, 16, method);
+    field(82, 3, 5);
+    field(85, 4, 3);
+    return {bits[2], bits[1], bits[0]};
+}
+} // namespace
+
+TEST_CASE("Real Maxwell front DMA snapshots hit, read live CPU RAM and reject invalidations",
+          "[video_core][dma_snapshot][native_macro]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    for (const int mode : {9, 10}) {
+        CAPTURE(mode);
+        Fixture f;
+        f.system.Initialize();
+        SnapshotRasterizer rasterizer;
+        f.fast.BindRasterizer(&rasterizer);
+        f.memory.BindRasterizer(&rasterizer);
+        f.device_memory.BindInterface(&rasterizer);
+        Kernel::KProcess process{f.system.Kernel()};
+        SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+        auto& table = process.GetPageTable().GetImpl();
+        table.Resize(20, 12);
+        constexpr VAddr cpu = 0x4000;
+        constexpr DAddr device = 0x10000;
+        constexpr GPUVAddr address = 0x100000;
+        constexpr GPUVAddr alias = 0x200000;
+        auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+        for (u64 page = 0; page < 2; ++page) {
+            const VAddr vaddr = cpu + page * 4096;
+            table.entries.GetAndFault(vaddr >> 12)
+                .Store(false, Common::PageType::Memory, 1,
+                       reinterpret_cast<uintptr_t>(backing + page * 4096) - vaddr);
+        }
+        process.GetMemory().SetCurrentPageTable(process);
+        const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+        f.device_memory.Map(device, cpu, 8192, asid);
+        SCOPE_EXIT {
+            f.device_memory.Unmap(device, 8192);
+            f.device_memory.UnregisterProcess(asid);
+        };
+        f.memory.Map(address, device, 8192, Tegra::PTEKind::PITCH, false);
+        f.memory.Map(alias, device, 4096, Tegra::PTEKind::PITCH, false);
+        const std::array<u32, 2> initial{11, 22};
+        const std::array<u32, 2> second_page{55, 66};
+        std::memcpy(backing, initial.data(), sizeof(initial));
+        std::memcpy(backing + 4096, second_page.data(), sizeof(second_page));
+        f.fast.SetNativeTuringMacroMode(true);
+        auto& mme = f.fast.GetNativeMacroEngine();
+        mme.ClearCode(0);
+        // Same public synthetic instruction encoder as native_macro_fifo.cpp; no guest code.
+        for (const auto instruction : {SnapshotFifoInstruction(0x158, false),
+                                       SnapshotFifoInstruction(0x200, true),
+                                       SnapshotFifoInstruction(0x201, false)}) {
+            for (const u32 word : instruction) {
+                mme.AddCode(0, word);
+            }
+        }
+        f.fast.GetNativeMacroPositions()[0] = 0;
+        REQUIRE_FALSE(f.fast.execution_mask[0x200]);
+        REQUIRE_FALSE(f.fast.execution_mask[0x201]);
+        VideoCommon::GpuSplit split;
+        Access::Start(split, f.system);
+        Access::EnableDmaSnapshots(split, mode);
+        SCOPE_EXIT { split.Stop(); };
+        const auto state = [&](u32 method, u32 value) {
+            f.fast.FrontCallMethod(f.system, split, method, value, true);
+        };
+        state(0x154, 0);
+        state(0x155, static_cast<u32>(address));
+        const auto read = [&] {
+            f.fast.FrontCallMethod(f.system, split, 0xe00, 2, true);
+            split.Drain();
+            return std::array<u32, 2>{f.fast.regs.reg_array[0x200], f.fast.regs.reg_array[0x201]};
+        };
+        REQUIRE(read() == initial);
+        REQUIRE(rasterizer.flushed_begin == device);
+        REQUIRE(rasterizer.flushed_bytes == 4096); // Whole page, not only the two words read.
+        REQUIRE(read() == initial); // FinishFrontMacro from the first call was conservative.
+        auto flushes = rasterizer.query_flushes.load();
+        auto checks = rasterizer.query_checks.load();
+        REQUIRE(read() == initial);
+        REQUIRE(rasterizer.query_checks.load() > checks); // real eligible hit checked reports
+        REQUIRE(rasterizer.query_flushes.load() == flushes + (mode == 10 ? 1 : 0));
+
+        const u32 cpu_value = 77;
+        std::memcpy(backing, &cpu_value, sizeof(cpu_value));
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == std::array<u32, 2>{77, 22});
+        REQUIRE(rasterizer.query_flushes.load() == flushes + (mode == 10 ? 1 : 0));
+
+        split.Defer([] {}); // an unknown producer invalidates every snapshot
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == std::array<u32, 2>{77, 22});
+        REQUIRE(rasterizer.query_flushes.load() > flushes);
+
+        // A real CB upload through another GPU alias must invalidate the device page.
+        state(CbAddressHigh, 0);
+        state(CbAddressLow, static_cast<u32>(alias));
+        state(CbSize, 8);
+        state(CbOffset, 0);
+        const u32 upload = 88;
+        f.fast.FrontCallMultiMethod(f.system, split, CbData, &upload, 1, 1);
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == std::array<u32, 2>{88, 22});
+        REQUIRE(rasterizer.query_flushes.load() > flushes);
+
+        rasterizer.report_pending.store(true);
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == std::array<u32, 2>{88, 22});
+        REQUIRE(rasterizer.query_flushes.load() > flushes);
+        REQUIRE_FALSE(rasterizer.report_pending.load());
+
+        // Direct mapping-generation invalidation, without relying on the ring's unknown mark.
+        f.memory.Map(address, device + 4096, 4096, Tegra::PTEKind::PITCH, false);
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == second_page);
+        REQUIRE(rasterizer.query_flushes.load() > flushes);
+        if (mode == 10) {
+            // Deliberately make the exact drained read differ: mode10 must consume that value.
+            rasterizer.change_on_flush = backing + 4096;
+            rasterizer.replacement = 99;
+            checks = rasterizer.query_checks.load();
+            REQUIRE(read() == std::array<u32, 2>{99, 66});
+            REQUIRE(rasterizer.query_checks.load() > checks);
+        }
+    }
+}
+#endif

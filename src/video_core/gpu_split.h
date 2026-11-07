@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/dma_snapshot.h"
 
 namespace Core {
 class System;
@@ -109,7 +110,7 @@ public:
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment) {
+                const GPUVAddr* segment, DmaSnapshotWrite snapshot_write = {}) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -119,17 +120,19 @@ public:
         if (segment != nullptr) {
             entry[1] = *segment;
         }
-        Commit(words);
+        Commit(words, snapshot_write);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                     DmaSnapshotWrite snapshot_write = {});
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    DmaSnapshotWrite snapshot_write = {}) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
-        Commit(1);
+        Commit(1, snapshot_write);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -184,6 +187,13 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
+    [[nodiscard]] int DmaSnapshotMode() const {
+        return dma_snapshot_mode;
+    }
+    [[nodiscard]] const DmaSnapshotTracker& DmaSnapshotWrites() const {
+        return dma_snapshot_writes;
+    }
+
 private:
     friend struct GpuSplitTestAccess;
 
@@ -218,7 +228,10 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
-    void Commit(size_t words) {
+    void Commit(size_t words, DmaSnapshotWrite snapshot_write = {}) {
+        if (dma_snapshot_mode != 0) {
+            dma_snapshot_writes.Record(snapshot_write);
+        }
         write_position += words;
         if (write_position - published_local >= publish_every) {
             Publish();
@@ -254,6 +267,8 @@ private:
 
     // Front side.
     u64 write_position{};
+    int dma_snapshot_mode{};
+    DmaSnapshotTracker dma_snapshot_writes;
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 published_local{};

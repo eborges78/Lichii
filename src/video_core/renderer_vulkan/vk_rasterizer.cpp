@@ -1668,6 +1668,10 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
     return false;
 }
 
+bool RasterizerVulkan::HasCachedReports(DAddr addr, u64 size) {
+    return query_cache.HasCachedReports(addr, size);
+}
+
 bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
     return query_cache.IsRegionGpuModified(addr, size);
 }

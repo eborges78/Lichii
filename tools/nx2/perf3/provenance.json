@@ -106,5 +106,20 @@
     "radv_cache": "https://github.com/Djihads80/Eglantine/pull/714",
     "gpu_poll": "https://github.com/zortos293/Lichii/pull/446"
   },
-  "status": "experimental, not installed; no performance gain claimed"
+  "status": "experimental, not installed; no performance gain claimed",
+  "experiment": {
+    "name": "conservative-frizti-dma",
+    "base_source_commit": "c08f58ff58127457e8d6179a3f0da8d76d467d45",
+    "memory_experiment": "reverted; HostMemory matches c08",
+    "upstream_snapshot_commit": "8ac3666f7b514561b20cc9ad1be140d9184dd097",
+    "reviewed_pr345_head": "6e79fe68214bad425b3d60eba4090387337231de",
+    "patch_sha256": "3ae2dd125d6e9d1d10defbcdb7304dfbd3651b2a034b38e21c328cf65a8170e0",
+    "modes": {
+      "default": 0,
+      "off": 0,
+      "optimized": 9,
+      "validate_and_consume_exact": 10
+    },
+    "production_activation": false
+  }
 }
