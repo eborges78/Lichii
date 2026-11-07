@@ -88,8 +88,14 @@ public:
 
     // Pending or written-but-still-listed reports prevent a split-front snapshot hit.
     [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
+        // A snapshot holds mapping guards. Never wait on a cache operation which may
+        // itself need a mapping mutation; contention conservatively prevents a hit.
+        std::unique_lock lock(cache_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return true;
+        }
         bool result = false;
-        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
+        IterateCacheLocked<false>(addr, size, [&result](QueryLocation) { result = true; });
         return result;
     }
 
@@ -135,13 +141,18 @@ public:
 protected:
     template <bool remove_from_cache, typename Func>
     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
+        std::scoped_lock lock(cache_mutex);
+        IterateCacheLocked<remove_from_cache>(addr, size, std::forward<Func>(func));
+    }
+
+    template <bool remove_from_cache, typename Func>
+    void IterateCacheLocked(VAddr addr, std::size_t size, Func&& func) {
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
         const u64 addr_begin = addr;
         const u64 addr_end = addr_begin + size;
 
         const u64 page_end = addr_end >> Core::DEVICE_PAGEBITS;
-        std::scoped_lock lock(cache_mutex);
         for (u64 page = addr_begin >> Core::DEVICE_PAGEBITS; page <= page_end; ++page) {
             const u64 page_start = page << Core::DEVICE_PAGEBITS;
             const auto in_range = [page_start, addr_begin, addr_end](const u32 query_location) {

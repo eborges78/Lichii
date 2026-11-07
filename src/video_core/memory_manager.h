@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -180,6 +181,18 @@ public:
     /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
+    // Lock order: GMMU -> backing -> nonblocking query inspection. The snapshot releases
+    // both before Drain/Run; ordinary read helpers do not recursively acquire either lock.
+    [[nodiscard]] std::shared_lock<std::shared_mutex> TryLockSnapshotMapping() const {
+        return std::shared_lock{snapshot_mapping_guard, std::try_to_lock};
+    }
+    [[nodiscard]] std::unique_lock<std::mutex> TryLockSnapshotBacking() const {
+        return memory.TryLockMapping();
+    }
+    [[nodiscard]] u64 BackingMappingGeneration() const {
+        return memory.MappingGeneration();
+    }
+
     [[nodiscard]] u64 MappingGeneration() const {
         return map_serial.load(std::memory_order_acquire);
     }
@@ -277,6 +290,7 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    mutable std::shared_mutex snapshot_mapping_guard;
     mutable std::mutex guard;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};

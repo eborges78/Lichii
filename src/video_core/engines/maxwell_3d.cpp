@@ -1048,6 +1048,7 @@ struct Maxwell3D::FrontState {
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     std::unordered_map<u64, u64> dma_snapshots; // device page -> writer stamp, at most 1024
     u64 snapshot_mapping{};
+    u64 snapshot_backing_mapping{};
     u64 snapshot_hits{};
     u64 snapshot_misses{};
     u64 snapshot_mismatches{};
@@ -1144,39 +1145,14 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
-VideoCommon::DmaSnapshotWrite Maxwell3D::FrontSnapshotWrite(const FrontState& fs, u32 method,
-                                                           u32 amount) const {
-    // Even a register write can issue a deferred draw. All executable methods stay opaque,
-    // except bounded constant-buffer writes whose device page is known (Frizti/#345).
-    if (fs.draw_pending || fs.control == Regs::ShadowRamControl::Replay) {
+VideoCommon::DmaSnapshotWrite Maxwell3D::FrontSnapshotWrite(const FrontState& fs, u32 method) const {
+    // Classifying a CB target before execution is unsafe across another channel's remap.
+    // Until that dependency is tracked, every executable method (including CB) is opaque.
+    // A state write may also flush a deferred draw or replay an executable shadow value.
+    if (fs.draw_pending || fs.control == Regs::ShadowRamControl::Replay || execution_mask[method]) {
         return {};
     }
-    if (!execution_mask[method]) {
-        return {.known = true};
-    }
-    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-    if (method < cb_data || method >= cb_data + 16) {
-        return {};
-    }
-    const u64 offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
-    const u64 size = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
-    const u64 bytes = u64{amount} * sizeof(u32);
-    const GPUVAddr base =
-        (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
-        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
-    if (offset > std::numeric_limits<GPUVAddr>::max() - base) {
-        return {};
-    }
-    const GPUVAddr address = base + offset;
-    if (bytes == 0 || offset > size || bytes > size - offset || bytes > 4096 ||
-        (address & 4095) + bytes > 4096) {
-        return {};
-    }
-    const auto device = memory_manager.GpuToCpuAddress(address);
-    if (!device || memory_manager.GpuToCpuAddress(address + bytes - 1) != *device + bytes - 1) {
-        return {};
-    }
-    return {.known = true, .begin = *device, .size = bytes};
+    return {.no_write = true};
 }
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -1206,7 +1182,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         return;
     }
     const auto snapshot_write = split.DmaSnapshotMode() != 0
-                                    ? FrontSnapshotWrite(fs, method, 1)
+                                    ? FrontSnapshotWrite(fs, method)
                                     : VideoCommon::DmaSnapshotWrite{};
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
@@ -1293,7 +1269,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         return;
     }
     const auto snapshot_write = split.DmaSnapshotMode() != 0
-                                    ? FrontSnapshotWrite(fs, method, amount)
+                                    ? FrontSnapshotWrite(fs, method)
                                     : VideoCommon::DmaSnapshotWrite{};
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -1478,21 +1454,34 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // no queued writer can have changed them. Unlike that branch, draws invalidate globally.
     const int snapshot_mode = split.DmaSnapshotMode();
     u64 mapping{};
+    u64 backing_mapping{};
+    std::shared_lock<std::shared_mutex> mapping_lock;
+    std::unique_lock<std::mutex> backing_lock;
     GPUVAddr page_begin{};
     GPUVAddr page_end{};
     std::optional<DAddr> device_begin;
     static const bool force_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
     bool snapshot_eligible = snapshot_mode != 0 && method == 0x158 && words != 0 &&
+                             (source & 3) == 0 &&
                              !Tegra::Nx2CmdPageDiag::g_enabled &&
                              !VideoCommon::QueryDma::TraceEnabled() &&
                              !force_drain;
     if (snapshot_eligible) {
+        mapping_lock = memory_manager.TryLockSnapshotMapping();
+        if (mapping_lock.owns_lock()) {
+            backing_lock = memory_manager.TryLockSnapshotBacking();
+        }
+        snapshot_eligible = mapping_lock.owns_lock() && backing_lock.owns_lock();
+    }
+    if (snapshot_eligible) {
         mapping = memory_manager.MappingGeneration();
+        backing_mapping = memory_manager.BackingMappingGeneration();
         page_begin = source & ~GPUVAddr{4095};
         page_end = (source + read_bytes + 4095) & ~GPUVAddr{4095};
-        if (fs.snapshot_mapping != mapping) {
+        if (fs.snapshot_mapping != mapping || fs.snapshot_backing_mapping != backing_mapping) {
             fs.dma_snapshots.clear();
             fs.snapshot_mapping = mapping;
+            fs.snapshot_backing_mapping = backing_mapping;
         }
         // Certify every page, including its end: checking only the two ends of a multi-page
         // mapping would miss a hole or an alias in the middle.
@@ -1503,7 +1492,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             snapshot_eligible = memory_manager.GpuToCpuAddress(page) == expected &&
                                 memory_manager.GpuToCpuAddress(page + 4095) == expected + 4095;
         }
-        snapshot_eligible &= mapping == memory_manager.MappingGeneration();
     }
     const auto report_snapshot = [&] {
         if (snapshot_mode == 0) {
@@ -1525,7 +1513,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
              ++page) {
             const auto found = fs.dma_snapshots.find(page);
             if (found == fs.dma_snapshots.end() ||
-                split.DmaSnapshotWrites().ChangedSince(found->second, device, read_bytes)) {
+                split.DmaSnapshotWrites().ChangedSince(found->second)) {
                 hit = false;
                 break;
             }
@@ -1536,25 +1524,38 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (hit && rasterizer->HasCachedReports(query_begin, read_bytes + device - query_begin)) {
             hit = false;
         }
-        if (hit && mapping == memory_manager.MappingGeneration()) {
+        if (hit) {
             thread_local std::vector<u32> snapshot_words;
             snapshot_words.resize(words);
-            memory_manager.ReadBlockUnsafe(source, snapshot_words.data(), read_bytes);
-            if (mapping == memory_manager.MappingGeneration()) {
-                ++fs.snapshot_hits;
-                if (snapshot_mode == 9) {
-                    fs.parameters.insert(fs.parameters.end(), snapshot_words.begin(), snapshot_words.end());
-                    report_snapshot();
-                    return;
-                }
-                verify_words = snapshot_words;
-            } else {
-                snapshot_eligible = false;
-                ++fs.snapshot_misses;
+            // A backing remap can split a formerly continuous big page. Copy at most one
+            // 4 KiB page at a time, while both translation tables are protected.
+            for (size_t offset = 0; offset < read_bytes;) {
+                const size_t bytes = std::min(read_bytes - offset,
+                                              size_t{4096 - ((source + offset) & 4095)});
+                // ReadWordsUnsafe also preserves the native syncpoint shim's scalar semantics.
+                memory_manager.ReadWordsUnsafe(source + offset,
+                    snapshot_words.data() + offset / sizeof(u32), bytes / sizeof(u32));
+                offset += bytes;
             }
+            ++fs.snapshot_hits;
+            if (snapshot_mode == 9) {
+                backing_lock.unlock();
+                mapping_lock.unlock();
+                fs.parameters.insert(fs.parameters.end(), snapshot_words.begin(), snapshot_words.end());
+                report_snapshot();
+                return;
+            }
+            verify_words = snapshot_words;
         } else {
             ++fs.snapshot_misses;
         }
+    }
+    // Never wait for the back while holding a mapping guard: queued map operations need it.
+    if (backing_lock.owns_lock()) {
+        backing_lock.unlock();
+    }
+    if (mapping_lock.owns_lock()) {
+        mapping_lock.unlock();
     }
     std::vector<u32> diag_before;
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
@@ -1615,7 +1616,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         fs.snapshot_mismatches);
         }
     }
-    if (snapshot_eligible && mapping == memory_manager.MappingGeneration()) {
+    if (snapshot_eligible) {
+        mapping_lock = memory_manager.TryLockSnapshotMapping();
+        if (mapping_lock.owns_lock()) {
+            backing_lock = memory_manager.TryLockSnapshotBacking();
+        }
+        snapshot_eligible = mapping_lock.owns_lock() && backing_lock.owns_lock() &&
+            mapping == memory_manager.MappingGeneration() &&
+            backing_mapping == memory_manager.BackingMappingGeneration();
+    }
+    if (snapshot_eligible) {
         constexpr size_t max_pages = 1024;
         const size_t pages = (page_end - page_begin) / 4096;
         if (fs.dma_snapshots.size() + pages > max_pages) {
@@ -1625,6 +1635,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         for (size_t page = 0; page < pages; ++page) {
             fs.dma_snapshots[*device_begin / 4096 + page] = stamp;
         }
+    }
+    if (backing_lock.owns_lock()) {
+        backing_lock.unlock();
+    }
+    if (mapping_lock.owns_lock()) {
+        mapping_lock.unlock();
     }
     report_snapshot();
     if (Tegra::Nx2CmdPageDiag::g_enabled) {

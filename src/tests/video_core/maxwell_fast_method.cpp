@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <random>
 #include <thread>
@@ -726,14 +727,14 @@ TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queu
     const u64 ready = split.DmaSnapshotWrites().Stamp();
     const u32 cpu_value = 123;
     std::memcpy(backing + 8, &cpu_value, sizeof(cpu_value));
-    REQUIRE_FALSE(split.DmaSnapshotWrites().ChangedSince(ready, device_address + 8, 4));
+    REQUIRE_FALSE(split.DmaSnapshotWrites().ChangedSince(ready));
     REQUIRE(f.memory.Read<u32>(gpu_address + 8) == cpu_value);
     REQUIRE(f.memory.Read<u32>(alias + 8) == cpu_value);
     const u64 mapping = f.memory.MappingGeneration();
     split.Defer([&] {
         f.memory.Map(alias, device_address + 0x1000, 0x1000, Tegra::PTEKind::PITCH, false);
     });
-    REQUIRE(split.DmaSnapshotWrites().ChangedSince(ready, device_address, 4));
+    REQUIRE(split.DmaSnapshotWrites().ChangedSince(ready));
     upload(alias, 4, {70});
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     REQUIRE(f.memory.Read<u32>(gpu_address) == 1);
@@ -743,7 +744,7 @@ TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queu
     const u64 before_stop = split.DmaSnapshotWrites().Stamp();
     split.Stop();
     REQUIRE(split.DmaSnapshotMode() == 0);
-    REQUIRE(split.DmaSnapshotWrites().ChangedSince(before_stop, device_address, 4));
+    REQUIRE(split.DmaSnapshotWrites().ChangedSince(before_stop));
 }
 
 TEST_CASE("Split consumption does not complete deferred downstream callbacks",
@@ -846,7 +847,7 @@ TEST_CASE("Every split entry is an unknown DMA snapshot writer unless explicitly
     VideoCommon::GpuSplitTestAccess::Initialize(split, f.system);
     VideoCommon::GpuSplitTestAccess::EnableDmaSnapshots(split);
     constexpr u32 method = Maxwell3D::RootTables::SelectMethod;
-    constexpr VideoCommon::DmaSnapshotWrite no_write{.known = true};
+    constexpr VideoCommon::DmaSnapshotWrite no_write{.no_write = true};
     split.Method(&f.fast, method, 0, true, nullptr, no_write); // engine selection invalidates
     const auto& writes = split.DmaSnapshotWrites();
     auto stamp = writes.Stamp();
@@ -854,31 +855,26 @@ TEST_CASE("Every split entry is an unknown DMA snapshot writer unless explicitly
     split.MacroWrite(&f.fast, method, 0, no_write);
     const std::array<u32, 2> arguments{0, 0};
     split.MultiMethod(&f.fast, method, arguments.data(), 2, 2, nullptr, no_write);
-    REQUIRE_FALSE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE_FALSE(writes.ChangedSince(stamp));
 
-    split.Method(&f.fast, method, 0, true, nullptr,
-                 {.known = true, .begin = 0x8000, .size = 4});
-    REQUIRE_FALSE(writes.ChangedSince(stamp, 0x4000, 4));
-    REQUIRE(writes.ChangedSince(stamp, 0x8000, 4));
-    stamp = writes.Stamp();
     split.Method(&f.fast, method, 0, true, nullptr);
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
     stamp = writes.Stamp();
     split.MacroWrite(&f.fast, method, 0);
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
     stamp = writes.Stamp();
     split.MultiMethod(&f.fast, method, arguments.data(), 2, 2, nullptr);
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
     stamp = writes.Stamp();
     split.Defer([] {});
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
     stamp = writes.Stamp();
     bool called = false;
     split.DeferFunction([&called] { called = true; });
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
     stamp = writes.Stamp();
     split.Method(&f.slow, method, 0, true, nullptr, no_write); // another engine/channel
-    REQUIRE(writes.ChangedSince(stamp, 0x4000, 4));
+    REQUIRE(writes.ChangedSince(stamp));
 
     // Execute real ring entries too, including freeing DeferFunction's owned callback.
     const auto end = VideoCommon::GpuSplitTestAccess::End(split);
@@ -900,8 +896,13 @@ public:
     std::atomic<bool> report_pending{};
     u8* change_on_flush{};
     u32 replacement{};
+    std::function<void()> on_query_check;
     bool HasCachedReports(DAddr, u64) override {
         ++query_checks;
+        if (on_query_check) {
+            auto callback = std::move(on_query_check);
+            callback();
+        }
         return report_pending.load();
     }
     void FlushQueryResults(DAddr, u64) override {
@@ -1097,6 +1098,71 @@ TEST_CASE("Real Maxwell front DMA snapshots hit, read live CPU RAM and reject in
             checks = rasterizer.query_checks.load();
             REQUIRE(read() == std::array<u32, 2>{99, 66});
             REQUIRE(rasterizer.query_checks.load() > checks);
+        }
+
+        // Two distinct SMMU addresses share one physical page. A CB through that alias
+        // invalidates globally, even though its DAddr differs from the snapshot's page.
+        constexpr DAddr device_alias = 0x30000;
+        f.device_memory.Map(device_alias, cpu, 4096, asid);
+        SCOPE_EXIT { f.device_memory.Unmap(device_alias, 4096); };
+        f.memory.Map(address, device, 4096, Tegra::PTEKind::PITCH, false);
+        f.memory.Map(alias, device_alias, 4096, Tegra::PTEKind::PITCH, false);
+        REQUIRE(read() == std::array<u32, 2>{88, 22});
+        state(CbOffset, 0);
+        const u32 smmu_upload = 123;
+        f.fast.FrontCallMultiMethod(f.system, split, CbData, &smmu_upload, 1, 1);
+        flushes = rasterizer.query_flushes.load();
+        REQUIRE(read() == std::array<u32, 2>{123, 22});
+        REQUIRE(rasterizer.query_flushes.load() > flushes);
+
+        // Start a real mutation while FrontDmaRead is inside its hit path. Its query
+        // callback runs after both mapping locks are held and before the RAM copy.
+        // Completion must wait for that copy; checking epochs alone fails this test.
+        for (const bool remap_backing : {false, true}) {
+            CAPTURE(remap_backing);
+            f.device_memory.Map(device, cpu, 4096, asid);
+            f.memory.Map(address, device, 4096, Tegra::PTEKind::PITCH, false);
+            std::memcpy(backing, initial.data(), sizeof(initial));
+            std::memcpy(backing + 4096, second_page.data(), sizeof(second_page));
+            REQUIRE(read() == initial);
+            REQUIRE(read() == initial);
+            std::promise<void> started;
+            std::promise<void> completed;
+            auto start = started.get_future();
+            auto completion = completed.get_future();
+            std::thread writer;
+            SCOPE_EXIT { if (writer.joinable()) writer.join(); };
+            bool mutation_blocked = false;
+            rasterizer.on_query_check = [&] {
+                writer = std::thread{[&] {
+                    started.set_value();
+                    if (remap_backing) {
+                        f.device_memory.Map(device, cpu + 4096, 4096, asid);
+                    } else {
+                        f.memory.Map(address, device + 4096, 4096, Tegra::PTEKind::PITCH,
+                                     false);
+                    }
+                    completed.set_value();
+                }};
+                start.wait();
+                mutation_blocked = completion.wait_for(std::chrono::milliseconds{20}) ==
+                                   std::future_status::timeout;
+            };
+            const auto during_remap = read();
+            if (writer.joinable()) {
+                writer.join();
+            }
+            REQUIRE(mutation_blocked);
+            if (mode == 9) {
+                REQUIRE(during_remap == initial);
+            }
+            // The next read must observe the new translation and re-certify: the mutation
+            // completed after the previous read's initial mapping epochs were sampled.
+            flushes = rasterizer.query_flushes.load();
+            REQUIRE(read() == second_page);
+            REQUIRE(rasterizer.query_flushes.load() > flushes);
+            // The independent SMMU alias still names the original physical page.
+            REQUIRE(f.memory.Read<u32>(alias) == initial[0]);
         }
     }
 }

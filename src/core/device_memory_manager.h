@@ -72,6 +72,15 @@ public:
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
 
+    // Snapshot callers take the GMMU guard first, then try this existing mutation lock.
+    // GetPointer/ReadBlockUnsafe do not lock it recursively. Never hold across GPU work.
+    [[nodiscard]] std::unique_lock<std::mutex> TryLockMapping() {
+        return std::unique_lock{mapping_guard, std::try_to_lock};
+    }
+    [[nodiscard]] u64 MappingGeneration() const {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
     // Write / Read
     template <typename T>
     T* GetPointer(DAddr address);

@@ -113,13 +113,15 @@
     "memory_experiment": "reverted; HostMemory matches c08",
     "upstream_snapshot_commit": "8ac3666f7b514561b20cc9ad1be140d9184dd097",
     "reviewed_pr345_head": "6e79fe68214bad425b3d60eba4090387337231de",
-    "patch_sha256": "3ae2dd125d6e9d1d10defbcdb7304dfbd3651b2a034b38e21c328cf65a8170e0",
+    "patch_sha256": "1c77c4e0a55296bbf92858a5e7edbf11d1afcdd2e7be21a539fd358ded9b0ec1",
     "modes": {
       "default": 0,
       "off": 0,
       "optimized": 9,
       "validate_and_consume_exact": 10
     },
-    "production_activation": false
+    "production_activation": false,
+    "coherency": "GMMU shared try-lock, backing existing try-lock+epoch, query try-lock; global writer epoch including CB",
+    "supersedes_unsafe_candidate": "ebc1e75cd6e624bc95287b081ae7995fda2e6d30"
   }
 }
