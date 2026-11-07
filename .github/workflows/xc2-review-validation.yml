@@ -1,0 +1,71 @@
+name: XC2 Linux validation
+on:
+  push:
+    branches: [ci/xc2-review-validation-v1]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CCACHE_DIR: /tmp/xc2-ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - name: Checkout exact candidate code
+        uses: actions/checkout@v5
+        with:
+          ref: 6ee8649e7a536ea84c9a4d4d6175e8d167b81c85
+          persist-credentials: false
+      - name: Verify exact source commit
+        run: test "$(git rev-parse HEAD)" = 6ee8649e7a536ea84c9a4d4d6175e8d167b81c85
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev libpulse-dev libtool libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build qt6-base-private-dev qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev ccache lld python3-venv libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          python3 -m venv /tmp/xc2-cmake
+          /tmp/xc2-cmake/bin/pip install cmake==3.31.6
+          echo /tmp/xc2-cmake/bin >> "$GITHUB_PATH"
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+      - name: Restore dependency and compiler caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cpm
+            /tmp/xc2-ccache
+          key: xc2-linux-gcc13-qt683-v1
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_LINKER=/usr/bin/ld.lld -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DUSE_CCACHE=ON -DUSE_FASTER_LINKER=ON -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_TESTS=ON -DBUILD_TESTING=ON -DDYNARMIC_TESTS=OFF -DENABLE_WERROR=ON -DYUZU_USE_BUNDLED_SDL3=ON -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON -Dfmt_FORCE_BUNDLED=ON
+          cmake --build build --parallel 4
+      - name: Run complete discovered test suites
+        env:
+          QT_QPA_PLATFORM: offscreen
+          XBC2_TEST_SPIRV_DIR: /tmp/xc2-synthetic-spirv
+        run: |
+          ctest --test-dir build --show-only=json-v1 > /tmp/xc2-tests.json
+          python3 -c 'import json; t=json.load(open("/tmp/xc2-tests.json")); n={x["name"] for x in t["tests"]}; assert {"tests","update_checker_tests","config_tests","compatibility_report"} <= n, n'
+          ctest --test-dir build --output-on-failure --parallel 2 --timeout 180
+      - name: Validate exported synthetic SPIR-V
+        shell: bash
+        run: |
+          shopt -s nullglob
+          modules=(/tmp/xc2-synthetic-spirv/*.spv)
+          test "${#modules[@]}" -gt 0
+          for module in "${modules[@]}"; do spirv-val --target-env vulkan1.1 "$module"; done
+          printf 'Validated %s synthetic modules\n' "${#modules[@]}"
+      - name: Preserve test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xc2-test-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
