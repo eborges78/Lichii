@@ -15,10 +15,10 @@ jobs:
       - name: Checkout exact candidate code
         uses: actions/checkout@v5
         with:
-          ref: 6ee8649e7a536ea84c9a4d4d6175e8d167b81c85
+          ref: 56a9406ddcf685ea8d46dc9a79f31cead1a7ca0a
           persist-credentials: false
       - name: Verify exact source commit
-        run: test "$(git rev-parse HEAD)" = 6ee8649e7a536ea84c9a4d4d6175e8d167b81c85
+        run: test "$(git rev-parse HEAD)" = 56a9406ddcf685ea8d46dc9a79f31cead1a7ca0a
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
